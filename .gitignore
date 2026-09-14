@@ -5,3 +5,6 @@ __pycache__/
 results/
 models/
 .env
+
+# personal project brief - not for publication
+INSTRUCTION.md
