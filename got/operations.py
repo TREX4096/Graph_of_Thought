@@ -33,16 +33,31 @@ Section 4.5 draws a sharp line:
   * **GRS** (Graph Reasoning State) is *dynamic*. It is the thoughts actually
     produced during execution, held in ``Operation.thoughts``.
 
-Keeping the plan separate from the state is what makes a GoO reusable across
-many input samples: the plan is rebuilt per sample but its *shape* is fixed by
-the task, while the thoughts differ every time.
+Cost discipline (matters on HPC, where GPU seconds are the budget)
+-------------------------------------------------------------------
+Every operation that talks to the model does so through **one batched call**
+(``lm.query_batch``) covering all of its inputs, rather than one call per
+input. On a GPU backend this is the difference between a saturated device and
+an idle one.
+
+To get the full benefit, a GoO should put sibling work in **one operation with
+many input thoughts** rather than in many parallel single-input operations --
+the Controller executes operations strictly one at a time, so four
+single-input operations cannot batch with each other, while one operation
+holding four thoughts can. ``KeepBestPerGroup`` and ``PairwiseAggregate``
+exist to make that style expressible; see ``got/tasks/sorting/graphs.py``.
+
+Each operation also carries a ``max_tokens`` budget and optional ``stop``
+strings. Decode time is roughly linear in tokens produced, so capping a step
+that needs 60 tokens at 60 rather than the global 1024 is a direct multiplier
+on cost.
 """
 
 from __future__ import annotations
 
 import abc
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .thought import Thought
 
@@ -106,6 +121,21 @@ class Operation(abc.ABC):
         """Subclass hook doing the actual work."""
         raise NotImplementedError
 
+    # ------------------------------------------------------------------
+    # Shared helper
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _new_thought(state: Dict[str, Any], operation: str, parents) -> Thought:
+        """Create a thought, lift the Parser's validity flag, and wire edges."""
+        t = Thought(
+            state=state,
+            valid=bool(state.get("valid", True)),
+            operation=operation,
+        )
+        for p in parents:
+            t.add_predecessor(p)
+        return t
+
     def __repr__(self) -> str:  # pragma: no cover
         return f"<{self.name} thoughts={len(self.thoughts)}>"
 
@@ -133,20 +163,29 @@ class InputOp(Operation):
 # Generation transformations
 # ======================================================================
 class Generate(Operation):
-    """Generation transformation: 1 thought -> k new thoughts.
+    """Generation transformation: each input thought -> k new thoughts.
 
     Paper: "one can generate one or more new thoughts based on an existing
     single thought v" (Section 3.2).
 
+    All input thoughts are processed in **one batched model call**, so a
+    single ``Generate`` holding four chunk thoughts costs one GPU round trip
+    rather than four.
+
     Parameters
     ----------
     prompt_name:
-        Which Prompter method to invoke (e.g. ``"sort"``, ``"split"``).
+        Which Prompter step to invoke (e.g. ``"sort"``, ``"split"``).
         The Prompter owns all task-specific wording; this operation stays
         generic.
     branching_factor:
         ``k`` -- how many independent samples to draw per input thought.
         k=1 makes this a plain CoT step; k>1 gives ToT-style branching.
+    max_tokens:
+        Cap on generated tokens for this step. Set it from what the step
+        actually needs; ``None`` falls back to the backend default.
+    stop:
+        Stop strings ending generation early once the answer is complete.
     """
 
     def __init__(
@@ -154,47 +193,51 @@ class Generate(Operation):
         prompt_name: str = "generate",
         branching_factor: int = 1,
         name: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        stop: Optional[Sequence[str]] = None,
     ) -> None:
         super().__init__(name or f"Generate({prompt_name},k={branching_factor})")
         self.prompt_name = prompt_name
         self.branching_factor = branching_factor
+        self.max_tokens = max_tokens
+        self.stop = stop
 
     def _execute(self, lm, prompter, parser, **kwargs) -> List[Thought]:
         inputs = self.get_input_thoughts()
         produced: List[Thought] = []
 
+        # Split inputs into local (free) work and work needing the model.
+        llm_parents: List[Thought] = []
+        llm_prompts: List[str] = []
+
         for parent in inputs:
             prompt = prompter.build(self.prompt_name, [parent.state], **kwargs)
 
-            # A prompt may be "pure" -- i.e. deterministic local work that
-            # needs no model at all (splitting a list into chunks is plain
-            # Python). Returning None from the Prompter signals this and
-            # saves a pointless LLM call. The paper's split step is likewise
-            # a structural decomposition, not a reasoning step.
+            # A prompt may be "pure" -- deterministic local work needing no
+            # model (splitting a list into chunks is plain Python). Returning
+            # None from the Prompter signals this and saves an LLM call. The
+            # paper's split step is likewise a structural decomposition, not
+            # a reasoning step.
             if prompt is None:
-                new_states = parser.parse_local(self.prompt_name, parent.state, **kwargs)
-                for st in new_states:
-                    t = Thought(
-                        state=st,
-                        valid=bool(st.get("valid", True)),
-                        operation=self.prompt_name,
-                    )
-                    t.add_predecessor(parent)
-                    produced.append(t)
+                for st in parser.parse_local(self.prompt_name, parent.state, **kwargs):
+                    produced.append(self._new_thought(st, self.prompt_name, [parent]))
                 continue
 
-            responses = lm.query(prompt, num_responses=self.branching_factor)
-            for raw in responses:
-                st = parser.parse(self.prompt_name, [parent.state], raw, **kwargs)
-                # The Parser reports structural validity via state["valid"];
-                # lift it onto the Thought so KeepValid/KeepBest can act on it.
-                t = Thought(
-                    state=st,
-                    valid=bool(st.get("valid", True)),
-                    operation=self.prompt_name,
-                )
-                t.add_predecessor(parent)
-                produced.append(t)
+            llm_parents.append(parent)
+            llm_prompts.append(prompt)
+
+        # One batched call for every prompt this operation needs.
+        if llm_prompts:
+            batched = lm.query_batch(
+                llm_prompts,
+                num_responses=self.branching_factor,
+                max_tokens=self.max_tokens,
+                stop=self.stop,
+            )
+            for parent, responses in zip(llm_parents, batched):
+                for raw in responses:
+                    st = parser.parse(self.prompt_name, [parent.state], raw, **kwargs)
+                    produced.append(self._new_thought(st, self.prompt_name, [parent]))
 
         return produced
 
@@ -203,7 +246,7 @@ class Generate(Operation):
 # Aggregation transformation -- the defining feature of GoT
 # ======================================================================
 class Aggregate(Operation):
-    """Aggregation transformation: k thoughts -> 1 (or k') merged thought(s).
+    """Aggregation transformation: all input thoughts -> merged thought(s).
 
     Paper: "one can aggregate arbitrary thoughts into new ones, to combine
     and reinforce the advantages of these thoughts, while eliminating their
@@ -229,10 +272,14 @@ class Aggregate(Operation):
         prompt_name: str = "aggregate",
         num_merges: int = 1,
         name: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        stop: Optional[Sequence[str]] = None,
     ) -> None:
         super().__init__(name or f"Aggregate({prompt_name},k={num_merges})")
         self.prompt_name = prompt_name
         self.num_merges = num_merges
+        self.max_tokens = max_tokens
+        self.stop = stop
 
     def _execute(self, lm, prompter, parser, **kwargs) -> List[Thought]:
         inputs = self.get_input_thoughts()
@@ -244,27 +291,116 @@ class Aggregate(Operation):
         prompt = prompter.build(self.prompt_name, states, **kwargs)
 
         if prompt is None:
-            merged_states = parser.aggregate_local(self.prompt_name, states, **kwargs)
-            responses_states = merged_states
+            new_states = parser.aggregate_local(self.prompt_name, states, **kwargs)
         else:
-            responses = lm.query(prompt, num_responses=self.num_merges)
-            responses_states = [
+            responses = lm.query_batch(
+                [prompt],
+                num_responses=self.num_merges,
+                max_tokens=self.max_tokens,
+                stop=self.stop,
+            )[0]
+            new_states = [
                 parser.parse(self.prompt_name, states, raw, **kwargs)
                 for raw in responses
             ]
 
+        # Wire an edge from EVERY input -- this is the in-degree > 1 that
+        # makes the structure a graph.
+        return [
+            self._new_thought(st, self.prompt_name, inputs) for st in new_states
+        ]
+
+
+class PairwiseAggregate(Operation):
+    """Aggregate consecutive *pairs* of input thoughts, all in one batch.
+
+    Why this exists
+    ---------------
+    A merge-sort style GoO needs several independent merges per level
+    (chunk0+chunk1, chunk2+chunk3, ...). Expressing each as its own
+    ``Aggregate`` operation is correct but wasteful on a GPU: the Controller
+    runs operations one at a time, so those merges execute serially and each
+    submits a batch of one.
+
+    ``PairwiseAggregate`` performs the whole level as a single operation, so
+    every pair's prompt goes to the model in **one batched call**. The
+    resulting graph is identical -- each merged thought still has in-degree 2
+    and is still a genuine aggregation.
+
+    Each output thought is tagged with ``_group`` (its pair index) so a
+    following ``KeepBestPerGroup`` can rank within each pair independently.
+    """
+
+    def __init__(
+        self,
+        prompt_name: str = "aggregate",
+        num_merges: int = 1,
+        name: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        stop: Optional[Sequence[str]] = None,
+    ) -> None:
+        super().__init__(name or f"PairwiseAggregate({prompt_name},k={num_merges})")
+        self.prompt_name = prompt_name
+        self.num_merges = num_merges
+        self.max_tokens = max_tokens
+        self.stop = stop
+
+    def _execute(self, lm, prompter, parser, **kwargs) -> List[Thought]:
+        inputs = self.get_input_thoughts()
+        if not inputs:
+            return []
+
+        # Pair up consecutive thoughts. An odd leftover is carried forward
+        # unchanged so no data is silently dropped.
+        pairs: List[List[Thought]] = [
+            inputs[i : i + 2] for i in range(0, len(inputs), 2)
+        ]
+
+        prompts: List[str] = []
+        # Carry the group index alongside each pair rather than looking it up
+        # later: list.index() on Thought lists is both O(n) and fragile.
+        prompt_pairs: List[tuple] = []
         produced: List[Thought] = []
-        for st in responses_states:
-            t = Thought(
-                state=st,
-                valid=bool(st.get("valid", True)),
-                operation=self.prompt_name,
+
+        for group, pair in enumerate(pairs):
+            if len(pair) == 1:
+                # Nothing to merge with: pass through, retagged for the next
+                # ranking step. Costs no model call.
+                st = dict(pair[0].state)
+                st["_group"] = group
+                produced.append(self._new_thought(st, "carry", pair))
+                continue
+
+            prompt = prompter.build(
+                self.prompt_name, [t.state for t in pair], **kwargs
             )
-            # Wire an edge from EVERY input -- this is the in-degree > 1 that
-            # makes the structure a graph.
-            for parent in inputs:
-                t.add_predecessor(parent)
-            produced.append(t)
+            if prompt is None:
+                for st in parser.aggregate_local(
+                    self.prompt_name, [t.state for t in pair], **kwargs
+                ):
+                    st = dict(st)
+                    st["_group"] = group
+                    produced.append(self._new_thought(st, self.prompt_name, pair))
+                continue
+
+            prompts.append(prompt)
+            prompt_pairs.append((group, pair))
+
+        if prompts:
+            batched = lm.query_batch(
+                prompts,
+                num_responses=self.num_merges,
+                max_tokens=self.max_tokens,
+                stop=self.stop,
+            )
+            for (group, pair), responses in zip(prompt_pairs, batched):
+                for raw in responses:
+                    st = parser.parse(
+                        self.prompt_name, [t.state for t in pair], raw, **kwargs
+                    )
+                    st = dict(st)
+                    st["_group"] = group
+                    produced.append(self._new_thought(st, self.prompt_name, pair))
 
         return produced
 
@@ -285,14 +421,14 @@ class Improve(Operation):
     volume computation) far simpler while preserving the full provenance
     chain. The distinction is bookkeeping, not behaviour.
 
+    Each refinement *round* is one batched call across all thoughts being
+    refined, so refining eight thoughts for three rounds costs three model
+    round trips, not twenty-four.
+
     Parameters
     ----------
     rounds:
         How many successive refinement passes to apply.
-    keep_best_only:
-        If True, only a refinement that scores at least as well as its parent
-        replaces it. This prevents the well-documented failure mode where
-        self-refinement degrades an already-good answer.
     """
 
     def __init__(
@@ -300,33 +436,56 @@ class Improve(Operation):
         prompt_name: str = "improve",
         rounds: int = 1,
         name: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        stop: Optional[Sequence[str]] = None,
     ) -> None:
         super().__init__(name or f"Improve({prompt_name},r={rounds})")
         self.prompt_name = prompt_name
         self.rounds = rounds
+        self.max_tokens = max_tokens
+        self.stop = stop
 
     def _execute(self, lm, prompter, parser, **kwargs) -> List[Thought]:
         current = self.get_input_thoughts()
-        produced: List[Thought] = []
+        if not current:
+            return []
 
-        for parent in current:
-            node = parent
-            for _ in range(self.rounds):
+        # Refine every thought in lockstep, one batched call per round.
+        for _ in range(self.rounds):
+            prompts: List[str] = []
+            targets: List[Thought] = []
+            for node in current:
                 prompt = prompter.build(self.prompt_name, [node.state], **kwargs)
                 if prompt is None:
-                    break
-                raw = lm.query(prompt, num_responses=1)[0]
-                st = parser.parse(self.prompt_name, [node.state], raw, **kwargs)
-                refined = Thought(
-                    state=st,
-                    valid=bool(st.get("valid", True)),
-                    operation=self.prompt_name,
-                )
-                refined.add_predecessor(node)
-                node = refined
-            produced.append(node)
+                    continue
+                prompts.append(prompt)
+                targets.append(node)
 
-        return produced
+            if not prompts:
+                break
+
+            batched = lm.query_batch(
+                prompts,
+                num_responses=1,
+                max_tokens=self.max_tokens,
+                stop=self.stop,
+            )
+
+            refreshed: List[Thought] = []
+            replaced = {id(t) for t in targets}
+            for node, responses in zip(targets, batched):
+                if not responses:
+                    refreshed.append(node)
+                    continue
+                st = parser.parse(
+                    self.prompt_name, [node.state], responses[0], **kwargs
+                )
+                refreshed.append(self._new_thought(st, self.prompt_name, [node]))
+
+            # Carry through any thought that had no prompt this round.
+            current = refreshed + [t for t in current if id(t) not in replaced]
+
+        return current
 
 
 # ======================================================================
@@ -340,10 +499,11 @@ class Score(Operation):
 
       * **local** -- a deterministic Python function. Sorting and set
         intersection use this ("use cases such as sorting use simple local
-        scoring functions"). Free and exact.
+        scoring functions"). **Free and exact** -- and on HPC, dramatically
+        cheaper than asking the model. Prefer it wherever the task permits.
       * **LLM-based** -- ask the model to rate the thought. Document merging
         needs this, since redundancy and information retention have no
-        closed-form measure.
+        closed-form measure. All thoughts are scored in one batched call.
 
     Parameters
     ----------
@@ -353,7 +513,11 @@ class Score(Operation):
     n_votes:
         For LLM scoring, how many times to ask and average. The paper queries
         "3 times for each value, and take the average" for document merging,
-        because single LLM judgements are noisy.
+        because single LLM judgements are noisy. Each extra vote costs a full
+        generation, so raise it only where the noise actually matters.
+    max_tokens:
+        Defaults to 8 -- a score is a couple of digits, and letting the model
+        run to a 1024-token default here is pure waste.
     """
 
     def __init__(
@@ -362,27 +526,45 @@ class Score(Operation):
         prompt_name: str = "score",
         n_votes: int = 1,
         name: Optional[str] = None,
+        max_tokens: Optional[int] = 8,
+        stop: Optional[Sequence[str]] = ("\n",),
     ) -> None:
         super().__init__(name or "Score")
         self.scoring_fn = scoring_fn
         self.prompt_name = prompt_name
         self.n_votes = n_votes
+        self.max_tokens = max_tokens
+        self.stop = stop
 
     def _execute(self, lm, prompter, parser, **kwargs) -> List[Thought]:
         inputs = self.get_input_thoughts()
+        if not inputs:
+            return []
 
-        for t in inputs:
-            if self.scoring_fn is not None:
-                # Deterministic local scoring -- no model call, no cost.
+        if self.scoring_fn is not None:
+            # Deterministic local scoring -- no model call, no cost.
+            for t in inputs:
                 t.score = float(self.scoring_fn(t.state))
-            else:
-                prompt = prompter.build(self.prompt_name, [t.state], **kwargs)
-                raws = lm.query(prompt, num_responses=self.n_votes)
-                values = [parser.parse_score(raw) for raw in raws]
-                values = [v for v in values if v is not None]
-                # Average the votes; fall back to 0.0 if the model returned
-                # nothing parseable rather than crashing a long HPC run.
-                t.score = sum(values) / len(values) if values else 0.0
+                t.scored = True
+            return inputs
+
+        # LLM scoring: one batched call covering every thought.
+        prompts = [
+            prompter.build(self.prompt_name, [t.state], **kwargs) for t in inputs
+        ]
+        batched = lm.query_batch(
+            prompts,
+            num_responses=self.n_votes,
+            max_tokens=self.max_tokens,
+            stop=self.stop,
+        )
+
+        for t, raws in zip(inputs, batched):
+            values = [parser.parse_score(raw) for raw in raws]
+            values = [v for v in values if v is not None]
+            # Average the votes; fall back to 0.0 if the model returned
+            # nothing parseable rather than crashing a long HPC run.
+            t.score = sum(values) / len(values) if values else 0.0
             t.scored = True
 
         # Score annotates thoughts in place and passes them straight through,
@@ -421,6 +603,61 @@ class KeepBest(Operation):
         return kept
 
 
+class KeepBestPerGroup(Operation):
+    """Ranking within groups: keep the best ``n`` thoughts per group key.
+
+    Why this exists
+    ---------------
+    A plain ``KeepBest`` over a mixed population would keep the globally best
+    thoughts and discard entire chunks. To sort four chunks we need the best
+    candidate *for each chunk*.
+
+    The naive alternative is four separate sort/score/keep chains, one per
+    chunk. That works, but it forces four serial single-prompt model calls
+    where one batched call would do. Grouping lets a single ``Generate`` hold
+    all four chunks -- batching them -- while this operation still ranks
+    within each chunk independently.
+
+    Parameters
+    ----------
+    group_key:
+        State key identifying the group (e.g. ``"chunk_index"`` or
+        ``"_group"``). Thoughts lacking the key fall into a shared group.
+    n:
+        How many to keep per group.
+    """
+
+    def __init__(
+        self,
+        group_key: str = "_group",
+        n: int = 1,
+        name: Optional[str] = None,
+    ) -> None:
+        super().__init__(name or f"KeepBestPerGroup({group_key},n={n})")
+        self.group_key = group_key
+        self.n = n
+
+    def _execute(self, lm, prompter, parser, **kwargs) -> List[Thought]:
+        inputs = [t for t in self.get_input_thoughts() if t.valid]
+        if not inputs:
+            return []
+
+        groups: Dict[Any, List[Thought]] = {}
+        for t in inputs:
+            groups.setdefault(t.state.get(self.group_key), []).append(t)
+
+        kept: List[Thought] = []
+        # Sort group keys for deterministic output ordering -- the pairing in
+        # PairwiseAggregate depends on a stable order.
+        for key in sorted(groups, key=lambda k: (k is None, k)):
+            ranked = sorted(groups[key], key=lambda t: t.score, reverse=True)
+            for src in ranked[: self.n]:
+                c = src.copy(operation="keepbest")
+                c.add_predecessor(src)
+                kept.append(c)
+        return kept
+
+
 class KeepValid(Operation):
     """Filter out thoughts that failed structural validation.
 
@@ -441,9 +678,10 @@ class KeepValid(Operation):
 class Selector(Operation):
     """Pass through a caller-chosen subset of incoming thoughts.
 
-    Needed when a GoO branches: e.g. the sorting graph splits one input into
-    four chunks and then must route chunk *i* to the *i*-th sorting subgraph.
-    A plain edge would hand every chunk to every branch.
+    Useful for routing, but note the cost implication: splitting a population
+    into per-branch Selectors forces those branches to execute as separate
+    operations, which prevents batching. Prefer ``KeepBestPerGroup`` when the
+    goal is per-group ranking rather than genuine routing.
     """
 
     def __init__(

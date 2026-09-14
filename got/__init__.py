@@ -18,9 +18,11 @@ from .operations import (
     InputOp,
     Generate,
     Aggregate,
+    PairwiseAggregate,
     Improve,
     Score,
     KeepBest,
+    KeepBestPerGroup,
     KeepValid,
     Selector,
     GroundTruth,
@@ -33,7 +35,8 @@ __version__ = "0.1.0"
 
 __all__ = [
     "Thought", "Operation", "InputOp", "Generate", "Aggregate", "Improve",
-    "Score", "KeepBest", "KeepValid", "Selector", "GroundTruth",
+    "Score", "KeepBest", "KeepBestPerGroup", "KeepValid", "Selector", "GroundTruth",
+    "PairwiseAggregate",
     "Controller", "AbstractPrompter", "AbstractParser",
     "volume", "latency", "graph_metrics", "theoretical_bounds",
 ]

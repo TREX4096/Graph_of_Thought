@@ -157,6 +157,14 @@ class AbstractLanguageModel(abc.ABC):
         self._cache_enabled = cache
         self._cache: Dict[str, List[str]] = {}
 
+        # Optional per-invocation log used by scripts/estimate_cost.py to
+        # price an HPC job *before* it is submitted. Each entry records the
+        # shape of one backend invocation: how many prompts, how many samples
+        # each, and the token budget that was allowed. Off by default -- it is
+        # pure overhead during a real run.
+        self.record_calls: bool = False
+        self.call_log: List[Dict[str, Any]] = []
+
     # ------------------------------------------------------------------
     # Subclass hooks
     # ------------------------------------------------------------------
@@ -323,13 +331,22 @@ class AbstractLanguageModel(abc.ABC):
                 max_tokens or self.max_tokens,
             )
 
+            budget = max_tokens or self.max_tokens
             raw = self._generate_batch(
-                to_send,
-                num_responses,
-                max_tokens=max_tokens or self.max_tokens,
-                stop=stop,
+                to_send, num_responses, max_tokens=budget, stop=stop,
             )
             self._account(to_send, raw)
+
+            if self.record_calls:
+                self.call_log.append({
+                    "n_prompts": len(to_send),
+                    "num_responses": num_responses,
+                    "max_tokens": budget,
+                    "prompt_tokens": sum(self._count_tokens(p) for p in to_send),
+                    "completion_tokens": sum(
+                        self._count_tokens(r) for rs in raw for r in rs
+                    ),
+                })
 
             for slot, src in zip(pending_idx, mapping):
                 results[slot] = list(raw[src])

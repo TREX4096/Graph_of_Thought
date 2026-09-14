@@ -175,20 +175,29 @@ class Controller:
         return None
 
     def all_thoughts(self) -> List[Thought]:
-        """Every thought produced during the run -- i.e. the full GRS."""
+        """Every thought produced during the run -- i.e. the full GRS.
+
+        Single traversal with one shared visited set. An earlier version
+        restarted the ancestor walk for each thought, which re-visited the
+        same subgraphs repeatedly and cost O(V*E) on large graphs; with
+        aggregation-heavy GoT runs that is a real slowdown when dumping
+        results for hundreds of instances.
+        """
         seen: Dict[int, Thought] = {}
+        stack: List[Thought] = []
+
         for op in self.execution_order:
-            for t in op.thoughts:
-                seen[t.id] = t
-                # Include ancestors too: Score passes thoughts through, so
-                # some vertices are reachable only via predecessor links.
-                stack = list(t.predecessors)
-                while stack:
-                    p = stack.pop()
-                    if p.id in seen:
-                        continue
-                    seen[p.id] = p
-                    stack.extend(p.predecessors)
+            stack.extend(op.thoughts)
+
+        while stack:
+            t = stack.pop()
+            if t.id in seen:
+                continue
+            seen[t.id] = t
+            # Include ancestors: Score passes thoughts through, so some
+            # vertices are reachable only via predecessor links.
+            stack.extend(t.predecessors)
+
         return list(seen.values())
 
     def graph_summary(self) -> Dict[str, Any]:

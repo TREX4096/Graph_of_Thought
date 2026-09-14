@@ -23,22 +23,29 @@ from __future__ import annotations
 from typing import List
 
 from ...operations import (
-    Aggregate,
     Generate,
     GroundTruth,
     InputOp,
     KeepBest,
+    KeepBestPerGroup,
     Operation,
+    PairwiseAggregate,
     Score,
-    Selector,
 )
 from .scoring import intersection_score, is_correct_intersection
 
 
-def _pick_chunk(index: int):
-    def _sel(thoughts):
-        return [t for t in thoughts if t.state.get("chunk_index") == index]
-    return _sel
+def token_budget(n_elements: int) -> int:
+    """Generation cap for a list of ``n_elements`` integers.
+
+    Set elements here can be multi-digit (the generator draws from a universe
+    four times the set size), so we budget more per element than the sorting
+    task does. Still far below a 1024-token default, which is the point.
+    """
+    return max(64, 4 * n_elements + 32)
+
+
+STOP = ("\n\n", "\nInput", "Example:")
 
 
 def got_intersection_goo(
@@ -48,7 +55,13 @@ def got_intersection_goo(
     branching_factor: int = 3,
     aggregation_attempts: int = 5,
 ) -> List[Operation]:
-    """Build the GoT Graph of Operations for set intersection."""
+    """Build the GoT Graph of Operations for set intersection.
+
+    Like the sorting graph, sibling work is folded into single operations
+    holding many thoughts so that each level costs one batched model call
+    rather than one call per branch. See ``got/tasks/sorting/graphs.py`` for
+    the full rationale.
+    """
     if num_chunks & (num_chunks - 1) != 0:
         raise ValueError(f"num_chunks must be a power of two, got {num_chunks}")
 
@@ -60,55 +73,55 @@ def got_intersection_goo(
     split = Generate(prompt_name="split", name="SplitB")
     split.add_predecessor(root)
 
-    leaves: List[Operation] = []
-    for i in range(num_chunks):
-        pick = Selector(_pick_chunk(i), name=f"PickChunk{i}")
-        pick.add_predecessor(split)
+    # Intersect every subset of B against the whole of A -- one batched call.
+    # The result of each is at most |A| elements, but in practice far fewer.
+    gen = Generate(
+        prompt_name="intersect",
+        branching_factor=branching_factor,
+        name=f"IntersectChunks(k={branching_factor})",
+        max_tokens=token_budget(len(set_a)),
+        stop=STOP,
+    )
+    gen.add_predecessor(split)
 
-        gen = Generate(
-            prompt_name="intersect",
-            branching_factor=branching_factor,
-            name=f"Intersect{i}(k={branching_factor})",
-        )
-        gen.add_predecessor(pick)
+    # Local scoring against the *global* truth: a chunk result containing no
+    # spurious elements scores well even though it is incomplete, which is
+    # the right signal for choosing between candidate partial intersections.
+    sc = Score(scoring_fn=intersection_score, name="ScoreChunks")
+    sc.add_predecessor(gen)
 
-        sc = Score(scoring_fn=None, name=f"ScoreChunk{i}")
-        # Local scoring against the partial truth is not meaningful per chunk
-        # (a chunk's correct answer is only part of the final set), so we use
-        # the global scorer: a chunk result that contains no spurious elements
-        # scores well even though it is incomplete.
-        sc.scoring_fn = intersection_score
-        sc.add_predecessor(gen)
+    level: Operation = KeepBestPerGroup(group_key="chunk_index", n=1,
+                                        name="KeepBestPerChunk")
+    level.add_predecessor(sc)
 
-        keep = KeepBest(n=1, name=f"KeepBestChunk{i}")
-        keep.add_predecessor(sc)
-        leaves.append(keep)
-
-    # Binary union tree.
-    level = leaves
+    # Binary union tree, one batched operation per level.
+    remaining = num_chunks
     depth = 0
-    while len(level) > 1:
+    while remaining > 1:
         depth += 1
-        nxt: List[Operation] = []
-        for j in range(0, len(level), 2):
-            agg = Aggregate(
-                prompt_name="aggregate",
-                num_merges=aggregation_attempts,
-                name=f"Union_L{depth}_{j // 2}",
-            )
-            agg.add_predecessor(level[j])
-            agg.add_predecessor(level[j + 1])
+        agg = PairwiseAggregate(
+            prompt_name="aggregate",
+            num_merges=aggregation_attempts,
+            name=f"Union_L{depth}(k={aggregation_attempts})",
+            max_tokens=token_budget(len(set_a)),
+            stop=STOP,
+        )
+        agg.add_predecessor(level)
 
-            sc = Score(scoring_fn=intersection_score, name=f"ScoreUnion_L{depth}_{j // 2}")
-            sc.add_predecessor(agg)
+        sc_u = Score(scoring_fn=intersection_score, name=f"ScoreUnion_L{depth}")
+        sc_u.add_predecessor(agg)
 
-            keep = KeepBest(n=1, name=f"KeepBestUnion_L{depth}_{j // 2}")
-            keep.add_predecessor(sc)
-            nxt.append(keep)
-        level = nxt
+        remaining //= 2
+        keep: Operation = (
+            KeepBestPerGroup(group_key="_group", n=1, name=f"KeepBestUnion_L{depth}")
+            if remaining > 1
+            else KeepBest(n=1, name=f"KeepBestUnion_L{depth}")
+        )
+        keep.add_predecessor(sc_u)
+        level = keep
 
     gt = GroundTruth(check_fn=is_correct_intersection, name="GroundTruth")
-    gt.add_predecessor(level[0])
+    gt.add_predecessor(level)
     return [gt]
 
 
@@ -118,7 +131,8 @@ def io_intersection_goo(set_a: List[int], set_b: List[int]) -> List[Operation]:
         {"set_a": list(set_a), "set_b": list(set_b), "current": list(set_b)},
         name="Input",
     )
-    gen = Generate(prompt_name="intersect", branching_factor=1, name="Intersect(IO)")
+    gen = Generate(prompt_name="intersect", branching_factor=1, name="Intersect(IO)",
+                   max_tokens=token_budget(len(set_a)), stop=STOP)
     gen.add_predecessor(root)
 
     sc = Score(scoring_fn=intersection_score, name="Score")

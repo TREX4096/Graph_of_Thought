@@ -160,6 +160,10 @@ def run_one(
         "score": best.score if best else 0.0,
         "max_score": len(numbers),
         "n_llm_calls": lm.usage.n_calls,
+        # Batches are GPU round trips and therefore what maps to cluster cost;
+        # n_llm_calls is prompts served. Their ratio is the mean batch size.
+        "n_batches": lm.usage.n_batches,
+        "mean_batch_size": round(lm.usage.mean_batch_size, 2),
         "prompt_tokens": lm.usage.prompt_tokens,
         "completion_tokens": lm.usage.completion_tokens,
         "total_tokens": lm.usage.total_tokens,
@@ -257,6 +261,7 @@ def main() -> None:
             "mean_error_scope": sum(r["error_scope"] for r in ok) / n,
             "mean_total_tokens": sum(r["total_tokens"] for r in ok) / n,
             "mean_llm_calls": sum(r["n_llm_calls"] for r in ok) / n,
+            "mean_batches": sum(r["n_batches"] for r in ok) / n,
             "mean_max_volume": sum(r["max_volume"] for r in ok) / n,
             "mean_max_latency": sum(r["max_latency"] for r in ok) / n,
             "mean_wall_seconds": sum(r["wall_seconds"] for r in ok) / n,
@@ -276,11 +281,12 @@ def main() -> None:
 
     # --- Report ------------------------------------------------------
     print(f"\n{'scheme':8s} {'acc':>7s} {'err':>8s} {'tokens':>10s} "
-          f"{'calls':>7s} {'vol':>6s} {'lat':>6s}")
-    print("-" * 58)
+          f"{'calls':>7s} {'batch':>7s} {'vol':>6s} {'lat':>6s}")
+    print("-" * 66)
     for scheme, s in summaries.items():
         print(f"{scheme:8s} {s['accuracy']:7.2%} {s['mean_error_scope']:8.2f} "
               f"{s['mean_total_tokens']:10.0f} {s['mean_llm_calls']:7.1f} "
+              f"{s['mean_batches']:7.1f} "
               f"{s['mean_max_volume']:6.1f} {s['mean_max_latency']:6.1f}")
 
     print(f"\nPer-instance CSV : {csv_path}")

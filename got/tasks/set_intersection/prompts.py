@@ -74,9 +74,14 @@ class SetIntersectionParser(AbstractParser):
         # ``set_a`` and ``set_b`` are the *global* inputs and must survive
         # every hop so the final thought can be scored against the true
         # intersection rather than against some sub-problem.
+        #
+        # Grouping keys must survive too: ``KeepBestPerGroup`` ranks within a
+        # chunk, and a thought that lost its ``chunk_index`` would be pooled
+        # with every other chunk, discarding all but one branch.
         base = {
             "set_a": parent.get("set_a", []),
             "set_b": parent.get("set_b", []),
+            **{k: parent[k] for k in ("chunk_index", "_group") if k in parent},
         }
 
         if values is None:

@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import random
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from .base import AbstractLanguageModel
 
@@ -179,8 +179,18 @@ class MockLM(AbstractLanguageModel):
     # ------------------------------------------------------------------
     # AbstractLanguageModel implementation
     # ------------------------------------------------------------------
-    def _generate(self, prompt: str, num_responses: int) -> List[str]:
+    def _generate(
+        self,
+        prompt: str,
+        num_responses: int,
+        max_tokens: Optional[int] = None,
+        stop: Optional[Sequence[str]] = None,
+    ) -> List[str]:
         """Dispatch on prompt content and return ``num_responses`` samples.
+
+        ``max_tokens`` and ``stop`` are accepted for interface compatibility
+        and ignored: the mock emits exactly one short line, so it can never
+        exceed a token budget or run past a stop string.
 
         Each sample is generated independently, so the k candidates of a
         Generate(k) operation genuinely differ -- which is what gives

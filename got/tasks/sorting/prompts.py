@@ -162,12 +162,24 @@ class SortingParser(AbstractParser):
         else:
             original = list(parent.get("original", parent.get("current", [])))
 
+        # Grouping metadata must survive parsing. ``KeepBestPerGroup`` ranks
+        # candidates within their own chunk, so a sorted chunk that lost its
+        # ``chunk_index`` would fall into a shared group and all but one
+        # chunk would be silently discarded -- the graph would then "sort"
+        # only a fraction of the input.
+        carried = {
+            k: parent[k]
+            for k in ("chunk_index", "_group")
+            if k in parent
+        }
+
         values = self.extract_list(raw)
 
         if values is None:
             # Parse failure. Mark invalid and keep the parent's data so the
             # thought is still structurally usable; KeepValid will drop it.
             return {
+                **carried,
                 "current": list(parent.get("current", [])),
                 "original": original,
                 "valid": False,
@@ -175,6 +187,7 @@ class SortingParser(AbstractParser):
             }
 
         return {
+            **carried,
             "current": values,
             "original": original,
             "valid": True,

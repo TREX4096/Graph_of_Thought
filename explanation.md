@@ -1,698 +1,830 @@
-# explanation.md — Reasoning, Interpretation, and Deep Dive
+# explanation.md — Mathematical Deep Dive and Design Rationale
 
-This document records **how I read the four papers, what every term means, and why
-the implementation is built the way it is**. It is written to be read top-to-bottom
-by someone who has not read the papers.
+This document develops the theory behind the four papers **formally**, derives the
+results rather than quoting them, and records why the implementation is built the way
+it is.
 
-The reading order is the one the project instructions specify, and it is the right
-one, because each paper is a direct response to a limitation of the previous:
+Reading order follows the project instructions, and it is the right one: each paper is a
+direct response to a mathematical limitation of the previous.
 
 ```
 Chain-of-Thought  →  Tree of Thoughts  →  Graph of Thoughts
    (2022)               (2023)                (2024)
       │                                          ▲
       └──────── Multimodal-CoT (2023) ───────────┘
-                (orthogonal branch:
-                 adds vision, not structure)
+                (orthogonal: adds vision, not structure)
 ```
 
 **Contents**
 
-1. [The one idea that connects all four papers](#1-the-one-idea-that-connects-all-four-papers)
-2. [Paper 1 — Chain-of-Thought Prompting](#2-paper-1--chain-of-thought-prompting)
-3. [Paper 2 — Tree of Thoughts](#3-paper-2--tree-of-thoughts)
-4. [Paper 3 — Multimodal Chain-of-Thought](#4-paper-3--multimodal-chain-of-thought)
-5. [Paper 4 — Graph of Thoughts (the focus)](#5-paper-4--graph-of-thoughts-the-focus)
-6. [The latency–volume tradeoff, explained properly](#6-the-latencyvolume-tradeoff-explained-properly)
-7. [Glossary of every term](#7-glossary-of-every-term)
-8. [How the papers map onto this codebase](#8-how-the-papers-map-onto-this-codebase)
-9. [Implementation decisions and why I made them](#9-implementation-decisions-and-why-i-made-them)
-10. [Bugs found during development (and what they taught me)](#10-bugs-found-during-development-and-what-they-taught-me)
-11. [What I verified, and what I did not](#11-what-i-verified-and-what-i-did-not)
+1. [Notation](#1-notation)
+2. [The autoregressive bottleneck — stated formally](#2-the-autoregressive-bottleneck--stated-formally)
+3. [Paper 1 — Chain-of-Thought](#3-paper-1--chain-of-thought)
+4. [Paper 2 — Tree of Thoughts](#4-paper-2--tree-of-thoughts)
+5. [Paper 3 — Multimodal Chain-of-Thought](#5-paper-3--multimodal-chain-of-thought)
+6. [Paper 4 — Graph of Thoughts](#6-paper-4--graph-of-thoughts)
+7. [Why decomposition works — the error model](#7-why-decomposition-works--the-error-model)
+8. [Best-of-k and the role of exact scoring](#8-best-of-k-and-the-role-of-exact-scoring)
+9. [The latency–volume theorem, with proof](#9-the-latencyvolume-theorem-with-proof)
+10. [The scoring functions — formal properties](#10-the-scoring-functions--formal-properties)
+11. [Cost model](#11-cost-model)
+12. [Glossary](#12-glossary)
+13. [Paper → code map](#13-paper--code-map)
+14. [Implementation decisions](#14-implementation-decisions)
+15. [Bugs found, and what they taught me](#15-bugs-found-and-what-they-taught-me)
+16. [What I verified, and what I did not](#16-what-i-verified-and-what-i-did-not)
 
 ---
 
-## 1. The one idea that connects all four papers
+## 1. Notation
 
-A language model generates text **one token at a time, left to right**. Each token is
-chosen based on everything before it. There is no "undo", no "try both branches", no
-"think about it and come back".
+| Symbol | Meaning |
+|---|---|
+| $p_\theta$ | the language model, with parameters $\theta$ |
+| $x$ | problem input |
+| $y$ | final answer |
+| $z_i$ | the $i$-th intermediate thought |
+| $z_{1\ldots n}$ | a sequence of $n$ thoughts |
+| $s = [x, z_{1\ldots i}]$ | a *state* — input plus thoughts so far (ToT) |
+| $G=(V,E)$ | the reasoning graph (GoT); $V$ thoughts, $E$ dependencies |
+| $k$ | branching factor — samples drawn per step |
+| $k_a$ | aggregation attempts — samples drawn per merge |
+| $m$ | number of chunks the input is split into |
+| $N$ | total thought budget (total LLM calls) |
+| $n$ | problem size (e.g. list length) |
+| $\mathcal{E}(v,G,p_\theta)$ | score of thought $v$ |
+| $\mathcal{R}(G,p_\theta,h)$ | the $h$ top-ranked thoughts |
+| $V(t)$, $L(t)$ | volume and latency of thought $t$ |
 
-For a task like "what is the capital of France?", that's fine. For a task like "sort
-these 64 numbers" or "play this game of 24", it is not — because those tasks require
-you to *explore*, *evaluate*, and sometimes *abandon* a line of work.
+---
 
-All four papers attack this same problem, and they differ only in **what structure they
-impose on the intermediate reasoning**:
+## 2. The autoregressive bottleneck — stated formally
 
-| Paper | Structure of reasoning | What it can newly do |
+A decoder-only transformer defines a distribution over token sequences by the chain rule
+of probability:
+
+$$
+p_\theta(w_1,\ldots,w_T) \;=\; \prod_{t=1}^{T} p_\theta\!\left(w_t \mid w_{<t}\right)
+$$
+
+Two facts follow, and together they are the reason all four papers exist.
+
+**Fact 1 — compute per token is constant.** A forward pass through an $L$-layer model with
+hidden width $d$ costs $\Theta(L d^2 + L\,T d)$ per token, *independent of how hard the
+question is*. A problem needing more computation than one token's worth cannot get it,
+unless more tokens are emitted.
+
+**Fact 2 — decisions are irrevocable.** Sampling $w_t$ conditions everything after it.
+There is no operator in this factorisation for "revise $w_{t-5}$". The distribution is
+strictly left-to-right.
+
+Writing $y$ for the answer and $z$ for intermediate work, **direct prompting** asks for
+
+$$
+y \sim p_\theta(y \mid x)
+$$
+
+and the model must compress all reasoning into the forward passes producing $y$. If $y$ is
+a single token, that is exactly one forward pass' worth of computation for arbitrarily
+hard $x$.
+
+**Every subsequent idea in these papers is a different answer to: what structure should
+the intermediate $z$ have?**
+
+| Paper | Structure of $z$ | Formally |
 |---|---|---|
-| CoT | A **chain** | Show intermediate steps at all |
-| CoT-SC | **k independent chains** | Sample several answers, vote |
-| ToT | A **tree** | Branch, evaluate, backtrack, prune |
-| GoT | An arbitrary **graph (DAG)** | **Aggregate** separate lines of reasoning; refine in loops |
-| MM-CoT | A chain, but **two-stage + vision** | Reason over images, not just text |
+| CoT | chain | $z_1 \to z_2 \to \cdots \to z_n \to y$ |
+| CoT-SC | $k$ disjoint chains | $k$ i.i.d. samples of the above |
+| ToT | tree | $V$ with $\deg^-(v) \le 1$ |
+| GoT | DAG | $V$ with $\deg^-(v)$ unbounded |
 
-The progression CoT → ToT → GoT is a progression in **graph topology**. That is the
-single most important thing to understand about this project. Multimodal-CoT is on a
-different axis entirely — it changes the *input modality*, not the *reasoning shape*.
+That last row — the removal of the in-degree constraint — is the entire contribution of
+Graph of Thoughts.
 
 ---
 
-## 2. Paper 1 — Chain-of-Thought Prompting
+## 3. Paper 1 — Chain-of-Thought
 
 > Wei et al., *Chain-of-Thought Prompting Elicits Reasoning in Large Language Models*,
-> NeurIPS 2022. (arXiv:2201.11903)
+> NeurIPS 2022. [arXiv:2201.11903](https://arxiv.org/abs/2201.11903)
 
-### The core claim
+### 3.1 The formal object
 
-If you show a model a few examples that include **the intermediate reasoning steps**,
-not just the answer, it will imitate that behaviour and produce its own reasoning —
-and it gets dramatically more questions right.
+CoT introduces intermediate thoughts $z_1,\ldots,z_n$ between $x$ and $y$, each sampled
+conditioned on everything before it:
 
-### The mechanism, concretely
+$$
+z_i \sim p_\theta^{\mathrm{CoT}}\!\left(z_i \mid x, z_{1\ldots i-1}\right),
+\qquad
+y \sim p_\theta^{\mathrm{CoT}}\!\left(y \mid x, z_{1\ldots n}\right)
+$$
 
-**Standard few-shot prompting** gives the model input→output pairs:
+In practice the whole thing is sampled as one continuous sequence:
 
-```
-Q: Roger has 5 tennis balls. He buys 2 more cans of tennis balls.
-   Each can has 3 tennis balls. How many does he have now?
-A: The answer is 11.
+$$
+[z_{1\ldots n}, y] \sim p_\theta^{\mathrm{CoT}}(z_{1\ldots n}, y \mid x)
+$$
 
-Q: The cafeteria had 23 apples. If they used 20 to make lunch
-   and bought 6 more, how many apples do they have?
-A:                                    ← model must answer in one leap
-```
-The model answers **27**. Wrong.
+Note what this does **not** specify: the decomposition of $z$ into steps is left
+ambiguous — is $z_i$ a phrase, a sentence, a paragraph? ToT's first contribution is to
+make that choice explicit.
 
-**Chain-of-thought prompting** gives input→*reasoning*→output triples:
+### 3.2 Why it works — a computational argument
 
-```
-Q: Roger has 5 tennis balls. ...
-A: Roger started with 5 balls. 2 cans of 3 tennis balls each is
-   6 tennis balls. 5 + 6 = 11. The answer is 11.        ← the chain of thought
+Compare the total computation available.
 
-Q: The cafeteria had 23 apples. ...
-A:
-```
-The model now produces: *"The cafeteria had 23 apples originally. They used 20 to make
-lunch. So they had 23 - 20 = 3. They bought 6 more apples, so they have 3 + 6 = 9. The
-answer is 9."* Correct.
+*Direct:* answer of $T_y$ tokens ⟹ $\Theta(T_y)$ forward passes.
 
-### Why it works — the deeper reason
+*CoT:* answer preceded by $T_z$ reasoning tokens ⟹ $\Theta(T_z + T_y)$ forward passes.
 
-This is the part worth internalising, because **it is the justification for everything
-that follows in ToT and GoT**:
+Since $T_z \gg T_y$ for a hard problem, CoT buys roughly a factor $T_z/T_y$ more
+computation — **without changing $\theta$ at all**. The paper states this as its first
+listed property:
 
-A transformer does a **fixed amount of computation per token**. A hard problem may need
-more computation than one token's worth. By emitting intermediate tokens, the model
-gives itself **more forward passes to work with**, and each intermediate result is
-written into the context where later steps can read it.
-
-In other words: **the context window is being used as a scratchpad / working memory.**
-The reasoning chain is not just an explanation for humans — it is computation.
-
-The paper states this as its first listed property:
-
-> "chain of thought, in principle, allows models to **decompose multi-step problems into
-> intermediate steps**, which means that **additional computation can be allocated** to
+> "chain of thought, in principle, allows models to decompose multi-step problems into
+> intermediate steps, which means that **additional computation can be allocated** to
 > problems that require more reasoning steps."
 
-### Headline results
+There is a second, information-theoretic reading. The context window acts as an external
+memory. Writing $z_i$ into the context makes it available to every later step at
+$O(1)$ retrieval cost via attention, whereas an unwritten intermediate result must be
+re-derived inside the residual stream at every layer. **The chain of thought is
+computation, not just explanation.**
 
-- PaLM 540B on GSM8K (grade-school math word problems): **18% → 57%** solve rate.
-- This beat the prior state of the art, which was a *fine-tuned* GPT-3 175B **with a
-  verifier** (33%).
-- No gradient updates, no training data. Just eight hand-written exemplars.
+### 3.3 The worked example
 
-### Emergence — the critical caveat
+Standard prompting on the cafeteria problem yields *"The answer is 27"* — wrong.
+CoT prompting yields:
 
-CoT is an **emergent ability of scale**. Below roughly 10B parameters it does not help
-and often *hurts* — small models produce fluent-sounding but logically broken chains,
-and then confidently follow them to a wrong answer.
+> "The cafeteria had 23 apples originally. They used 20 to make lunch. So they had
+> 23 − 20 = 3. They bought 6 more apples, so they have 3 + 6 = 9. The answer is 9."
 
-**Why this matters directly for our project:** we are running open-source models, and
-locally we can only fit a 1.5B model. A 1.5B model is *below the emergence threshold*.
-This is not a flaw in our implementation — it is a documented property of the method,
-and it is exactly why the local path uses a mock backend for logic validation and
-defers real quality measurement to the HPC with an 8B+ model.
+Each arithmetic step is a separate sub-computation with its result written down.
 
-### The limitations that motivate the next paper
+### 3.4 Results and the emergence threshold
 
-1. **One chain, one shot.** If the first step is wrong, everything after it is wrong.
-   There is no recovery.
-2. **No exploration.** The model never considers an alternative first step.
-3. **No evaluation.** Nothing ever asks "is this partial answer any good?"
+| Model | GSM8K solve rate |
+|---|---|
+| Prior SOTA (fine-tuned GPT-3 175B + verifier) | 33% |
+| PaLM 540B, standard prompting | 18% |
+| **PaLM 540B, CoT prompting** | **57%** |
+
+Critically, CoT is an **emergent ability of scale**. Writing $A(\theta)$ for CoT accuracy
+gain, empirically
+
+$$
+A(\theta) \approx 0 \quad\text{for } |\theta| \lesssim 10^{10}, \qquad
+A(\theta) > 0 \quad\text{for } |\theta| \gtrsim 10^{10}
+$$
+
+Below threshold, models produce fluent but logically invalid chains and then follow them
+confidently to wrong answers — CoT can be *worse* than direct prompting.
+
+**Direct consequence for this project:** locally we can fit only a 1.5B model, which is
+an order of magnitude below the threshold. This is why the local path uses a mock backend
+for logic validation and defers quality measurement to the HPC with an 8B+ model. It is a
+documented property of the method, not a defect in the implementation.
+
+### 3.5 CoT-SC (Self-Consistency)
+
+> Wang et al., ICLR 2023. Not one of our four PDFs, but the baseline both ToT and GoT
+> measure against.
+
+Sample $k$ chains independently and take the modal answer:
+
+$$
+\left[z^{(i)}_{1\ldots n}, y^{(i)}\right] \sim p_\theta^{\mathrm{CoT}}(\cdot \mid x),
+\quad i=1\ldots k,
+\qquad
+\hat y \;=\; \arg\max_{y} \; \#\{\, i : y^{(i)} = y \,\}
+$$
+
+**Why it helps:** many reasoning paths reach one correct answer, but errors are
+idiosyncratic. Correct answers concentrate; wrong answers disperse. If each chain is
+correct with probability $p$ and errors are i.i.d. across a large answer space, the mode
+is correct with probability approaching 1 as $k$ grows.
+
+**Its two limitations**, both named by ToT:
+
+1. **No local exploration** — within a chain there is still no branching.
+2. **Voting requires a small answer space.** If $y$ is a 64-element list, no two samples
+   will ever be identical, so $\#\{i : y^{(i)} = y\} = 1$ for every sample and the mode is
+   meaningless.
+
+Limitation 2 is decisive for sorting, which is why our `cot_sc` baseline selects by
+*score* rather than by majority — the only sensible adaptation to a large output space.
 
 ---
 
-### CoT-SC (Self-Consistency) — the intermediate step
+## 4. Paper 2 — Tree of Thoughts
 
-> Wang et al., *Self-Consistency Improves Chain of Thought Reasoning*, ICLR 2023.
+> Yao et al., NeurIPS 2023. [arXiv:2305.10601](https://arxiv.org/abs/2305.10601)
 
-Not one of our four PDFs, but both ToT and GoT treat it as the baseline to beat, so it
-must be understood.
+### 4.1 Framing
 
-**The idea:** sample `k` independent chains at temperature > 0, then take a **majority
-vote** over the final answers.
+The paper opens with dual-process theory: **System 1** (fast, automatic, associative)
+versus **System 2** (slow, deliberate, planning). Autoregressive generation is System 1;
+ToT bolts on a System 2.
 
-Formally: sample `[z₁…ₙ⁽ⁱ⁾, y⁽ⁱ⁾] ~ p(z, y | x)` for `i = 1…k`, then return
-`argmax_y #{i : y⁽ⁱ⁾ = y}`.
+Formally it adopts Newell & Simon's problem-space model: search a tree whose nodes are
+partial solutions and whose edges are operators.
 
-**Why it helps:** there are many valid reasoning paths to one correct answer, but
-errors are idiosyncratic. Correct answers cluster; wrong answers scatter.
+### 4.2 The four design questions
 
-**Its two limitations** (ToT names both explicitly):
-1. **No local exploration.** Within any single chain there is still no branching.
-2. **Voting needs a small answer space.** "Most frequent answer" is meaningless when
-   the answer is a 64-element list or a paragraph of prose — no two samples will ever
-   be identical.
+A ToT instantiation is the tuple $(G, V, \text{search})$ answering four questions. GoT
+inherits and extends this structure, so it is worth stating precisely.
 
-The second point is decisive for our sorting task, and it's why our `cot_sc` baseline
-uses *best-scored* selection rather than majority voting.
+**(1) Thought decomposition.** A state is $s = [x, z_{1\ldots i}]$. Thought granularity is
+a genuine trade-off:
 
----
+$$
+\underbrace{\text{too small}}_{\text{unevaluable}} \;\ll\; |z_i| \;\ll\; \underbrace{\text{too large}}_{\text{ungeneratable}}
+$$
 
-## 3. Paper 2 — Tree of Thoughts
-
-> Yao et al., *Tree of Thoughts: Deliberate Problem Solving with Large Language Models*,
-> NeurIPS 2023. (arXiv:2305.10601)
-
-### The framing: System 1 vs System 2
-
-The paper opens with dual-process theory from cognitive science:
-
-- **System 1** — fast, automatic, associative. ≈ token-by-token generation.
-- **System 2** — slow, deliberate, planning. ≈ what LLMs lack.
-
-ToT's goal is to bolt a System 2 onto a System 1 model. It borrows from Newell &
-Simon's classical problem-solving work: humans search a **combinatorial problem space**,
-a tree whose nodes are partial solutions and whose branches are operators.
-
-The paper names the two shortcomings of CoT precisely:
-
-> "1) **Locally**, they do not explore different continuations within a thought process
-> — the branches of the tree. 2) **Globally**, they do not incorporate any type of
-> planning, lookahead, or backtracking."
-
-### The four design questions
-
-ToT is a *framework*, and instantiating it means answering four questions. This
-structure is worth memorising — GoT inherits and extends it.
-
-#### 1. Thought decomposition — what is one "thought"?
-
-A **state** is `s = [x, z₁…ᵢ]` — the input plus the thoughts so far.
-
-A thought's size is a genuine engineering tradeoff:
-- Too small (one token): the model can't evaluate whether it's promising.
-- Too big (a whole book): the model can't generate diverse, coherent candidates.
-
-The paper's own instantiations show the range:
-
-| Task | One thought is... |
+| Task | One thought is |
 |---|---|
-| Game of 24 | one equation, e.g. `13 - 9 = 4 (left: 4, 4, 10)` |
-| Creative Writing | a paragraph-level writing plan |
-| Crosswords | a word for one clue |
+| Game of 24 | one equation, `13 - 9 = 4 (left: 4, 4, 10)` |
+| Creative Writing | a paragraph-level plan |
+| Crosswords | one word |
 
-#### 2. Thought generator `G(p_θ, s, k)` — how to propose candidates
+**(2) Thought generator $G(p_\theta, s, k)$.** Two strategies:
 
-Two strategies:
+$$
+\text{(a) i.i.d. sampling:}\quad z^{(j)} \sim p_\theta^{\mathrm{CoT}}(z_{i+1} \mid s),\quad j=1\ldots k
+$$
+$$
+\text{(b) propose-all:}\quad \left[z^{(1)},\ldots,z^{(k)}\right] \sim p_\theta^{\mathrm{propose}}\!\left(z^{(1\ldots k)}_{i+1} \mid s\right)
+$$
 
-- **(a) Sample i.i.d.** — call the same CoT prompt `k` times at temperature > 0.
-  Best when the thought space is *rich* (paragraphs), where independent samples are
-  naturally diverse.
-- **(b) Propose sequentially** — one "propose prompt" that emits all `k` candidates at
-  once. Best when the space is *constrained* (a single word, one equation), because
-  seeing the other candidates in-context stops the model repeating itself.
+(a) suits rich thought spaces where independent samples are naturally diverse; (b) suits
+constrained spaces, because conditioning on the other candidates prevents duplicates.
+Our `Generate(branching_factor=k)` implements (a), correct for sorting where each
+candidate is a long structured object.
 
-*This distinction shows up in our code:* `Generate(branching_factor=k)` implements
-strategy (a), which is the right choice for sorting (each candidate sorting is a long
-structured object).
+**(3) State evaluator $V(p_\theta, S)$.** ToT's cleverest move. Classical search needs a
+heuristic; those are normally hand-programmed (Deep Blue) or learned (AlphaGo). ToT
+proposes a third: **ask the LLM**.
 
-#### 3. State evaluator `V(p_θ, S)` — the heuristic
+$$
+\text{(a) value:}\quad V(p_\theta,S)(s) \sim p_\theta^{\mathrm{value}}(v \mid s)
+\qquad
+\text{(b) vote:}\quad V(p_\theta,S)(s) = \mathbb{1}[s = s^*],\; s^* \sim p_\theta^{\mathrm{vote}}(s^* \mid S)
+$$
 
-This is ToT's cleverest contribution. Classical search needs a heuristic; those are
-normally **hand-programmed** (Deep Blue) or **learned** (AlphaGo). ToT proposes a third
-option: **ask the LLM to evaluate the state**.
+The licensing observation:
 
-Two modes:
+> "Such valuations do not need to be perfect, and only need to be **approximately helpful
+> for decision making**."
 
-- **(a) Value each state independently** — prompt for a scalar (1–10) or a class
-  (`sure` / `likely` / `impossible`). Achieved via *lookahead* ("can 5, 5, 14 reach 24?
-  yes: 5+5+14") plus *commonsense* ("1 2 3 are too small to reach 24").
-- **(b) Vote across states** — show the model all candidates and ask which is best.
-  Used when quality is comparative rather than absolute (e.g. "which passage is more
-  coherent?").
+**(4) Search.** BFS with beam width $b$ (keep best $b$ per level), or DFS with pruning
+threshold $v_{th}$ and backtracking.
 
-Key insight, quoted because it's the licence for the whole approach:
+$$
+S_t \;=\; \arg\max_{S \subset S'_t,\; |S|=b} \; \sum_{s \in S} V_t(s)
+$$
 
-> "Such valuations do not need to be perfect, and only need to be **approximately
-> helpful for decision making**."
+### 4.3 Results
 
-#### 4. Search algorithm
-
-- **BFS (Algorithm 1)** — keep the best `b` states per level. Used when the tree is
-  shallow (T ≤ 3). This is a *beam search*.
-- **DFS (Algorithm 2)** — go deep on the most promising state; if the evaluator says a
-  state is hopeless (`V(s) ≤ v_th`), **prune the subtree and backtrack**.
-
-### Results
-
-| Method | Game of 24 success |
+| Method | Game of 24 |
 |---|---|
-| GPT-4 + IO prompting | 7.3% |
+| GPT-4 + IO | 7.3% |
 | GPT-4 + CoT | 4.0% |
-| GPT-4 + CoT-SC (k=100) | 9.0% |
-| **GPT-4 + ToT (b=5)** | **74%** |
+| GPT-4 + CoT-SC ($k$=100) | 9.0% |
+| **GPT-4 + ToT ($b$=5)** | **74%** |
 
-An 18× improvement over CoT. Search matters enormously for this class of problem.
+An 18× improvement over CoT.
 
-### The limitation that motivates GoT
+### 4.4 The structural limitation
 
-A tree has exactly one property that turns out to be fatal: **every node has exactly
-one parent.**
+A tree is precisely a connected acyclic graph in which
 
-Consequences:
-- Two promising branches can **never be combined**. You must pick one and discard the
-  other, throwing away whatever was good in the loser.
-- There is no way to express "merge these four sorted chunks into one sorted list",
-  because that operation has **four inputs and one output**.
-- Pruned subtrees are gone forever.
+$$
+\deg^-(v) \le 1 \quad \text{for all } v \in V
+$$
 
-GoT's entire contribution follows from removing this restriction.
+Three consequences, all fatal for the problems GoT targets:
+
+1. **Merging is inexpressible.** An operation with $k$ inputs and 1 output requires
+   $\deg^-(v) = k > 1$. Not a tree node. There is no workaround.
+2. **Discarded branches are lost.** Pruning at a node removes its entire subtree from
+   the information available to the answer.
+3. **Refinement loops are inexpressible.** Trees are acyclic, so $(v,v) \notin E$.
+
+Section 9 below shows this is not merely an expressiveness inconvenience — it costs ToT a
+factor of $N/\log_k N$ in *volume*.
 
 ---
 
-## 4. Paper 3 — Multimodal Chain-of-Thought
+## 5. Paper 3 — Multimodal Chain-of-Thought
 
-> Zhang et al., *Multimodal Chain-of-Thought Reasoning in Language Models*, TMLR 2024.
-> (arXiv:2302.00923)
+> Zhang et al., TMLR 2024. [arXiv:2302.00923](https://arxiv.org/abs/2302.00923)
 
-### Why this paper is in the set
+### 5.1 Why it is in the set
 
-It is **not** part of the CoT → ToT → GoT structural progression. It is an orthogonal
-extension: *what if the input includes images?* I read it to understand the boundary of
-the family, and it turns out to contain one lesson that genuinely transfers.
+This paper is **not** on the CoT → ToT → GoT structural axis. It extends the *input
+modality*, not the reasoning topology. I read it to establish the boundary of the family,
+and it contains one lesson that transfers directly.
 
-### The problem
+### 5.2 The two-stage factorisation
 
-Textbooks have figures. Science questions have diagrams. A text-only CoT cannot reason
-about them. The naive fix — caption the image, append the caption — loses information,
-because a caption is a lossy summary of a figure.
+Standard one-stage CoT with vision would sample rationale and answer jointly. MM-CoT
+factors them and conditions the second on the first:
 
-### The two-stage framework
+$$
+\text{Stage 1:}\quad R \sim p_\theta\!\left(R \mid Q, C, I\right)
+$$
+$$
+\text{Stage 2:}\quad A \sim p_\theta\!\left(A \mid Q, C, I, R\right)
+$$
 
-The paper's core proposal separates what CoT normally fuses:
+where $Q$ = question, $C$ = text context, $I$ = image features, $R$ = rationale,
+$A$ = answer. Both stages are fine-tuned (T5-based) with vision features fused in — a real
+difference from the other three papers, which are all training-free.
 
-```
-        ┌──────────────────────────────────────────────┐
-Stage 1 │ (Question, Context, Image)  →  Rationale      │   rationale generation
-        └──────────────────────────────────────────────┘
-                         │
-                         ▼
-        ┌──────────────────────────────────────────────┐
-Stage 2 │ (Question, Context, Image, Rationale) → Answer│   answer inference
-        └──────────────────────────────────────────────┘
-```
+### 5.3 The finding that matters
 
-Both stages are fine-tuned models (T5-based), and vision features are fused into both.
-Note that this is **fine-tuning**, not prompting — a real difference from the other
-three papers, which are all training-free.
+The authors first tried one-stage and found that models under 1B parameters generate
+**hallucinated rationales** — plausible but false reasoning — and the answer stage then
+faithfully follows them to a wrong answer. *Providing a rationale made accuracy worse.*
+Grounding the rationale in actual image features fixed it; their <1B model then beat
+GPT-3.5 on ScienceQA.
 
-### The finding that matters
+### 5.4 The transferable lesson
 
-The authors first tried the obvious one-stage approach and found something striking:
-models **under 1B parameters generate *hallucinated rationales*** — plausible-sounding
-reasoning that is factually wrong — and then the answer stage faithfully follows the
-bad reasoning to a wrong answer. Giving the model a rationale made it *worse*.
+> **A wrong reasoning step is worse than no reasoning step, because downstream steps
+> trust it.**
 
-Adding vision features fixed this: with the image actually available, the rationales
-became grounded, and accuracy jumped. Their <1B model beat GPT-3.5 and human average on
-ScienceQA.
+Write $P(\text{correct})$ for a two-stage pipeline:
 
-### The transferable lesson
+$$
+P(A \text{ correct}) = P(A \mid R\ \text{good})\,P(R\ \text{good}) + P(A \mid R\ \text{bad})\,P(R\ \text{bad})
+$$
 
-> **A reasoning step that is wrong is worse than no reasoning step at all, because
-> downstream steps trust it.**
+When $P(A \mid R\ \text{bad}) \ll P(A \mid \text{no } R)$ — i.e. bad reasoning actively
+misleads — the pipeline is worse than no reasoning at all unless $P(R\ \text{good})$ is
+high.
 
-This is directly relevant to GoT and to our implementation. In a graph of thoughts, a
-bad thought doesn't just produce a bad answer — it **propagates through every
-aggregation that consumes it**. That is precisely why GoT scores and ranks thoughts
-before merging them, and why our `KeepBest` sits between every `Generate` and the
+**This is why GoT scores and ranks before aggregating.** In a graph a bad thought does not
+merely produce one bad answer; it propagates into *every* aggregation that consumes it.
+Hence in our implementation a `KeepBest` sits between every `Generate` and the
 `Aggregate` that follows.
 
-It is also why our local 1.5B model is expected to underperform: it is in exactly the
-hallucinated-rationale regime this paper documents.
-
 ---
 
-## 5. Paper 4 — Graph of Thoughts (the focus)
+## 6. Paper 4 — Graph of Thoughts
 
-> Besta et al., *Graph of Thoughts: Solving Elaborate Problems with Large Language
-> Models*, AAAI 2024. (arXiv:2308.09687)
+> Besta et al., AAAI 2024. [arXiv:2308.09687](https://arxiv.org/abs/2308.09687)
 
-### The central claim
+### 6.1 Formal definition
 
-> "The key idea and primary advantage of GoT is the ability to model the information
-> generated by an LLM as an **arbitrary graph**, where units of information ('LLM
-> thoughts') are **vertices**, and **edges** correspond to **dependencies** between
-> these vertices."
+GoT is the tuple $(G, \mathcal{T}, \mathcal{E}, \mathcal{R})$:
 
-The human-reasoning motivation, from the introduction:
-
-> "one could explore a certain chain of reasoning, backtrack and start a new one, then
-> realize that a certain idea from the previous chain could be **combined** with the
-> currently explored one, and **merge them both into a new solution**, taking advantage
-> of their strengths and eliminating their weaknesses."
-
-That word — **merge** — is the whole paper.
-
-### Formal definition
-
-GoT is the tuple **(G, T, E, R)**:
-
-| Symbol | Name | Meaning |
+| Symbol | Name | Type |
 |---|---|---|
-| **G** = (V, E) | reasoning process | directed graph; `V` = thoughts, `E` = dependencies |
-| **T** | transformations | the operations that modify `G` |
-| **E** | evaluator | `E(v, G, p_θ) → score` |
-| **R** | ranking | `R(G, p_θ, h) → h best thoughts` |
+| $G = (V, E)$ | reasoning process | directed graph, $E \subseteq V \times V$ |
+| $\mathcal{T}$ | transformations | $\mathcal{T}(G, p_\theta) \to G'$ |
+| $\mathcal{E}$ | evaluator | $\mathcal{E}(v, G, p_\theta) \to \mathbb{R}$ |
+| $\mathcal{R}$ | ranking | $\mathcal{R}(G, p_\theta, h) \to V^h$ |
 
-A **vertex** holds a solution — initial, intermediate, or final. Its form is
-task-dependent: a sequence of numbers for sorting, a paragraph for writing.
+A vertex holds a solution (initial, intermediate or final); its form is task-dependent.
+An edge $(t_1,t_2)$ means $t_2$ was constructed **using $t_1$ as direct input**.
 
-A **directed edge (t₁, t₂)** means "thought t₂ was constructed **using t₁ as direct
-input**" — i.e. the LLM was explicitly instructed to use t₁ when generating t₂.
+> (The paper overloads $E$ for both the edge set and the evaluator. Context disambiguates;
+> I flag it because it is genuinely confusing on first reading.)
 
-Note `E` is used for both the edge set and the evaluator in the paper. Context
-disambiguates; I mention it because it confused me on first reading.
+A transformation is a pair of added and removed sets:
 
-### The three thought transformations
+$$
+\mathcal{T}(G, p_\theta) = (V^+, V^-, E^+, E^-),
+\qquad
+G' = \bigl((V \cup V^+)\setminus V^-,\; (E \cup E^+)\setminus E^-\bigr)
+$$
 
-This is the heart of the paper. Each transformation adds vertices `V⁺` and edges `E⁺`.
+### 6.2 The three transformations
 
-#### Generation — 1 → k
+**Generation** — $1 \to k$:
 
-```
-V⁺ = {v₁⁺, …, v_k⁺}
-E⁺ = {(v, v₁⁺), …, (v, v_k⁺)}
-```
+$$
+V^+ = \{v_1^+,\ldots,v_k^+\},\qquad E^+ = \{(v,v_1^+),\ldots,(v,v_k^+)\}
+$$
 
 ```
         v
       / | \
     v₁⁺ v₂⁺ v₃⁺
 ```
-Generate `k` new thoughts from one existing thought. **This is what CoT-SC and ToT
-already do.** Nothing new — GoT simply subsumes it.
 
-#### Aggregation — k → 1  ★ THE KEY ONE ★
+Subsumes CoT-SC and ToT branching. **Nothing new.**
 
-```
-V⁺ = {v⁺}
-E⁺ = {(v₁, v⁺), …, (v_k, v⁺)}
-```
+**Aggregation** — $k \to 1$. ★ The key one ★
+
+$$
+V^+ = \{v^+\},\qquad E^+ = \{(v_1,v^+),\ldots,(v_k,v^+)\}
+$$
 
 ```
     v₁   v₂   v₃   v₄
       \   \   /   /
-       \   \ /   /
-          v⁺            ← in-degree 4
+          v⁺          ← deg⁻(v⁺) = 4
 ```
 
-> "one can **aggregate arbitrary thoughts into new ones**, to combine and reinforce the
-> advantages of these thoughts, while eliminating their disadvantages."
+Since $\deg^-(v^+) = k$, and a tree requires $\deg^-\le 1$:
 
-**Why this is impossible in a tree:** a tree node has in-degree ≤ 1, by definition. A
-vertex with in-degree 4 is not a tree node. The moment you want to merge, you need a
-graph. There is no way around it.
+$$
+k > 1 \;\Longrightarrow\; G \text{ is not a tree.}
+$$
 
-The paper also notes this generalises beyond single thoughts: by adding outgoing edges
-from the *final* thoughts of several chains, you aggregate **entire reasoning paths**.
+**This is a theorem, not a preference.** The moment you want to merge, you need a graph.
 
-#### Refinement — self-loop
+**Refinement** — self-loop:
 
-```
-V⁺ = {}
-E⁺ = {(v, v)}
-```
+$$
+V^+ = \varnothing,\qquad E^+ = \{(v,v)\}
+$$
 
-```
-      ┌───┐
-      ▼   │
-      v ──┘
-```
-Improve a thought in place. Also impossible in a tree — trees are acyclic.
+Also impossible in a tree, which is acyclic.
 
-### Scoring and ranking
+### 6.3 Scoring and ranking
 
-**Score:** `E(v, G, p_θ)`. Note the signature includes the **whole graph G**, not just
-the vertex. The paper explains why: "in some evaluation scenarios, scores may be
-relative to other thoughts." Maximum generality.
+$$
+\mathcal{E}(v, G, p_\theta) \in \mathbb{R},
+\qquad
+\mathcal{R}(G,p_\theta,h) = \operatorname*{arg\,top-}_{v \in V}{}^{h}\; \mathcal{E}(v,G,p_\theta)
+$$
 
-**Rank:** `R(G, p_θ, h)` returns the `h` highest-scoring thoughts. The paper says it
-"most often" just takes the top `h` by score — a simple strategy that works.
+Note $\mathcal{E}$ takes the **whole graph** $G$, not just $v$ — "scores may be relative
+to other thoughts."
 
-Crucially, scoring can be **local and exact** where the task permits:
+Crucially, scoring may be **local and exact** where the task permits:
 
 > "use cases such as sorting use **simple local scoring functions**."
 
-For sorting, the score is computable in Python. This is free, exact, and noise-free —
-a large practical advantage over ToT, which leans on LLM-based state evaluation.
+For sorting the score is computable in Python: free, exact, zero-variance. This is a
+large practical advantage over ToT, which relies on noisy LLM-based state evaluation, and
+on HPC it is also a large *cost* advantage (§11).
 
-### System architecture (Section 4)
+### 6.4 Architecture — GoO vs GRS
 
 ```
- ┌───────────────────────────────────────────────────────────┐
+ ┌────────────────────────────────────────────────────────────┐
  │  CONTROLLER                                                │
- │    ┌──────────────────────┐   ┌────────────────────────┐   │
- │    │ GoO                  │   │ GRS                    │   │
- │    │ Graph of Operations  │   │ Graph Reasoning State  │   │
- │    │ ── STATIC ──         │   │ ── DYNAMIC ──          │   │
- │    │ the execution plan   │   │ the thoughts produced  │   │
- │    │ built once, upfront  │   │ updated as it runs     │   │
- │    └──────────────────────┘   └────────────────────────┘   │
- └────────┬──────────────┬──────────────┬────────────────────┘
-          │              │              │
-     ┌────▼────┐   ┌─────▼─────┐  ┌─────▼──────┐
-     │ Prompter│   │  Parser   │  │  Scoring & │
-     │         │   │           │  │ Validation │
-     │ builds  │   │ extracts  │  │            │
-     │ prompts │   │ thought   │  │ verifies + │
-     │         │   │ state     │  │ scores     │
-     └────┬────┘   └─────▲─────┘  └────────────┘
-          │              │
-          └──────► LLM ──┘
+ │   ┌──────────────────────┐   ┌────────────────────────┐    │
+ │   │ GoO                  │   │ GRS                    │    │
+ │   │ Graph of Operations  │   │ Graph Reasoning State  │    │
+ │   │ ── STATIC ──         │   │ ── DYNAMIC ──          │    │
+ │   │ the execution plan,  │   │ the thoughts produced, │    │
+ │   │ built once upfront   │   │ updated as it runs     │    │
+ │   └──────────────────────┘   └────────────────────────┘    │
+ └───────┬──────────────┬──────────────┬─────────────────────┘
+         │              │              │
+    ┌────▼────┐   ┌─────▼─────┐  ┌─────▼──────┐
+    │ Prompter│   │  Parser   │  │  Scoring & │
+    │ builds  │   │ extracts  │  │ Validation │
+    │ prompts │   │ state     │  │            │
+    └────┬────┘   └─────▲─────┘  └────────────┘
+         │              │
+         └──────► LLM ──┘
 ```
 
-The **GoO / GRS distinction** is the architectural insight and I want to state it
-clearly because it drove my implementation:
+The distinction that drove my implementation:
 
-- **GoO is the plan.** Static. Built before execution. "Split into 4, sort each 3 ways,
-  keep the best, merge pairwise 10 ways, keep the best." It is a DAG of *operations*.
-- **GRS is the state.** Dynamic. "Operation 7 produced these 3 thoughts, with these
-  scores, and this one was invalid." It is a DAG of *thoughts*.
+- **GoO is the plan.** A DAG of *operations*. Static, built before execution.
+- **GRS is the state.** A DAG of *thoughts*, with scores and validity. Dynamic.
 
-One GoO shape, executed on 100 different inputs, produces 100 different GRSs.
+One GoO shape executed on 100 inputs produces 100 different GRSs.
 
-### Use case: Sorting (Section 5.1)
+### 6.5 Use case: Sorting (§5.1)
 
-The task: sort numbers 0–9 **with duplicates**. The paper is explicit about why LLMs
-fail:
+Sort digits 0–9 **with duplicates**. The paper's diagnosis of why LLMs fail is precise:
 
-> "The considered LLMs are unable to sort a sequence of such numbers correctly beyond a
-> certain length consistently **because duplicate counts do not match**."
+> "unable to sort a sequence of such numbers correctly beyond a certain length
+> consistently **because duplicate counts do not match**."
 
-That is a precise diagnosis and it shapes the scoring function.
+The decomposition is merge sort. With $m$ chunks the recursion is
 
-**The decomposition is merge sort:**
-1. Split the input into subarrays.
-2. Sort each subarray (easy — they're short).
-3. Merge sorted subarrays pairwise (easier than sorting — inputs are already ordered).
+$$
+T(n) \;=\; \underbrace{m \cdot \text{sort}(n/m)}_{\text{chunk sorts}} \;+\; \underbrace{\sum_{\ell=1}^{\log_2 m} \tfrac{m}{2^\ell}\cdot\text{merge}\!\left(\tfrac{2^\ell n}{m}\right)}_{\text{merge tree}}
+$$
 
-**The GoO from Figure 4, for 64 numbers:**
+**The GoO (paper Figure 4), $n=64$, $m=4$:**
 
 ```
 [64 numbers]
-     │  Generate — split into 4 chunks of 16
+     │  split → 4 chunks of 16        (local, no LLM)
      ├──────────┬──────────┬──────────┐
    chunk0     chunk1     chunk2     chunk3
-     │ k=3       │ k=3      │ k=3      │ k=3     ← 3 candidate sortings each
-   Score      Score      Score      Score
-  KeepBest   KeepBest   KeepBest   KeepBest      ← N=1: best of the 3
-     │          │          │          │
+     │ k=3       │ k=3      │ k=3      │ k=3
+   Score      Score      Score      Score       (exact, free)
+  KeepBest   KeepBest   KeepBest   KeepBest     (N=1)
      └────┬─────┘          └────┬─────┘
-      Aggregate k=10        Aggregate k=10       ← 10 merge attempts each
+      Aggregate kₐ=10       Aggregate kₐ=10
         Score                 Score
        KeepBest              KeepBest
           └──────────┬──────────┘
-              Aggregate k=10
-                 Score
-                KeepBest
+              Aggregate kₐ=10
+                 Score → KeepBest
                    │
               [64 sorted]
 ```
 
-Note the asymmetry: **k=3 for sorting, k=10 for merging.** Merging gets more attempts
-because that's where global correctness is decided — a merge error corrupts the whole
-result, while a chunk error is contained.
+Note the asymmetry: $k=3$ for chunk sorting, $k_a=10$ for merging. Merging gets more
+attempts because that is where global correctness is decided — a merge error corrupts
+everything, while a chunk error is contained. §11 shows this is also the dominant cost
+term.
 
-**The scoring function** — this is the formula I implemented verbatim:
+### 6.6 Use case: Set Intersection (§5.2)
 
-```
-error-scope = X + Y
+Split $B$ only; intersect each piece against all of $A$; union the results. Valid because
+intersection distributes over union:
 
-X = Σᵢ₌₁^{m-1} sgn(max(bᵢ − bᵢ₊₁, 0))
-Y = Σᵢ₌₀^{9} | |{b_p : b_p = i}| − |{a_q : a_q = i}| |
-```
+$$
+A \cap \left(\bigcup_{i=1}^{m} B_i\right) \;=\; \bigcup_{i=1}^{m} \left(A \cap B_i\right)
+$$
 
-Reading it term by term:
+So the aggregation is an **exact union**. This illustrates the paper's general point
+nicely: *the right graph decomposition follows from the algebraic structure of the
+problem*, and GoT supplies the vocabulary for whatever that structure turns out to be.
 
-- **X — sortedness.** `sgn(max(bᵢ − bᵢ₊₁, 0))` is 1 exactly when `bᵢ > bᵢ₊₁`, i.e. an
-  adjacent descent. So X counts **adjacent inversions**, not total inversions. A list
-  sorted except for one swapped neighbouring pair scores X = 1.
-- **Y — multiset preservation.** For each digit 0–9, `|count_in_output − count_in_input|`.
-  Catches dropped elements and hallucinated duplicates — the exact failure mode
-  diagnosed above.
+### 6.7 Use cases: Keyword Counting (§5.3) and Document Merging (§5.4)
 
-**Why you need both:** a model could return a perfectly ascending list that quietly
-lost three elements (X = 0, but wrong). Or the right multiset in the wrong order
-(Y = 0, but wrong). Only `X + Y = 0` means genuinely correct.
+**Keyword counting** splits text into passages and sums sub-counts — aggregation is
+addition, again exact:
 
-**Sign convention:** the paper converts to a positive "higher is better" score with
-`max(n − error-scope, 0)`, and clips with `min(error-scope, n)` **for plotting only**
-("to improve the clarity of plots, as some baselines result in large numbers of
-outliers"). I kept clipping optional and off by default for analysis.
+$$
+\mathrm{count}(w, T) = \sum_{j=1}^{m} \mathrm{count}(w, T_j)
+$$
 
-### Use case: Set Intersection (Section 5.2)
+**Document merging** is the one task with no exact scorer, so the LLM judges. Query
+redundancy $r$ and retention $i$, three times each, average, then combine by **harmonic
+mean**:
 
-Split **set B** into subsets; intersect each against the **whole of A**; union the
-results.
+$$
+\text{score} = \frac{2ri}{r+i}
+$$
 
-The reason this is valid is algebraic:
+The harmonic mean is chosen because it is dominated by the smaller argument: you cannot
+win by deleting everything ($r=10$, $i=0 \Rightarrow 0$) or by concatenating everything
+($i=10$, $r=0 \Rightarrow 0$). The arithmetic mean would reward both degenerate
+strategies with 5.
 
-```
-A ∩ (B₁ ∪ B₂ ∪ … ∪ B_m) = (A ∩ B₁) ∪ (A ∩ B₂) ∪ … ∪ (A ∩ B_m)
-```
-
-Intersection distributes over union, so the aggregation step is an **exact union**.
-This is a nice illustration of the paper's broader point: *the right graph
-decomposition follows from the algebraic structure of the problem*, and GoT gives you
-the vocabulary to express whatever that structure turns out to be.
-
-**Scoring:**
-```
-error-scope = X1 + X2 + Xd
-  X1 = |C \ (A ∩ B)|    spurious elements
-  X2 = |(A ∩ B) \ C|    missing elements
-  Xd = duplicates in C
-```
-`Xd` exists "because the LLM expresses the set as a list in natural language" — a list
-can repeat where a set cannot.
-
-### Use case: Keyword Counting (Section 5.3)
-
-Split text into passages, count country mentions per passage, **sum** the sub-counts.
-Score = Σ |computed_count − true_count| over keywords.
-
-The aggregation here is arithmetic addition — again exact, again a different merge
-semantics from the previous two tasks.
-
-### Use case: Document Merging (Section 5.4)
-
-Merge several overlapping NDAs into one, minimising duplication while maximising
-information retention.
-
-This is the one task with **no exact scorer**, so the LLM is the judge:
-- Query for *redundancy* (10 = none) and *information retention* (10 = all).
-- **Ask 3 times for each and average** — single LLM judgements are noisy.
-- Combine with the **harmonic mean**, which punishes a bad score on either axis
-  (you cannot win by deleting everything, or by concatenating everything).
-
-### Headline results
+### 6.8 Headline result
 
 > "increasing the quality of sorting by **62% over ToT**, while simultaneously reducing
 > costs by **>31%**."
 
-Quality *and* cost, simultaneously — that's the claim worth testing.
+---
+
+## 7. Why decomposition works — the error model
+
+The papers assert that decomposition helps. Here is the argument made quantitative.
+
+### 7.1 The model
+
+Let $p(n)$ be the probability the model handles a length-$n$ instance correctly. Empirically
+accuracy decays roughly geometrically in the number of items that must be tracked
+simultaneously, so model it as
+
+$$
+p(n) \;=\; e^{-\lambda n}
+$$
+
+with $\lambda > 0$ a model-quality constant (smaller $\lambda$ = stronger model). This
+captures the paper's own observation that failures set in "beyond a certain length".
+
+### 7.2 Monolithic versus decomposed
+
+**IO (monolithic):**
+
+$$
+P_{\mathrm{IO}}(n) \;=\; p(n) \;=\; e^{-\lambda n}
+$$
+
+**ToT (best-of-$k$, still monolithic):** with an exact scorer, success needs at least one
+good sample among $k$:
+
+$$
+P_{\mathrm{ToT}}(n) \;=\; 1 - \bigl(1 - e^{-\lambda n}\bigr)^{k}
+$$
+
+**GoT (decomposed).** Write $q_k(p) = 1-(1-p)^k$. All $m$ chunks must succeed, then every
+merge must succeed:
+
+$$
+P_{\mathrm{GoT}}(n) \;=\; \underbrace{\Bigl[q_k\!\left(e^{-\lambda n/m}\right)\Bigr]^{m}}_{\text{chunks}}
+\cdot
+\underbrace{\prod_{\ell=1}^{\log_2 m} \Bigl[q_{k_a}\!\left(e^{-\lambda_{\mathrm{m}} 2^{\ell} n/m}\right)\Bigr]^{m/2^{\ell}}}_{\text{merge tree}}
+$$
+
+where $\lambda_{\mathrm{m}} < \lambda$ because merging two *already sorted* lists is an
+easier operation than sorting from scratch — the model mostly interleaves.
+
+### 7.3 The key inequality
+
+The decisive structural fact is that the exponential is evaluated at $n/m$, not $n$:
+
+$$
+p(n/m) = e^{-\lambda n/m} = \bigl[p(n)\bigr]^{1/m} \;\gg\; p(n)
+\qquad\text{for } m>1,\ \lambda n \gg 1
+$$
+
+For $\lambda = 0.035$, $n = 64$, $m = 4$:
+
+$$
+p(64) = e^{-2.24} \approx 0.106,
+\qquad
+p(16) = e^{-0.56} \approx 0.571
+$$
+
+A single chunk is **5.4× more likely** to be handled correctly than the whole input. With
+$k=3$ best-of-3 on each chunk, $q_3(0.571) = 1-0.429^3 \approx 0.921$, and all four chunks
+succeed with $0.921^4 \approx 0.72$ — versus $0.106$ monolithically.
+
+![Decomposition maths](docs/figures/theory_decomposition.png)
+
+*Left: success probability against input length for the three schemes, at
+$\lambda=0.035$, $m=4$, $k=3$. Right: the ratio $P_{\mathrm{GoT}}/P_{\mathrm{IO}}$, which
+grows with $n$ — decomposition matters more the harder the instance. Generated by
+`scripts/make_theory_figures.py`.*
+
+### 7.4 Why there is an optimum $m$
+
+More chunks means easier sub-problems but more merges, and each merge is a fresh chance to
+fail. Taking logs of the chunk term,
+
+$$
+\log P_{\text{chunks}} = m \log q_k\!\left(e^{-\lambda n/m}\right)
+$$
+
+increases with $m$, while the merge term contributes $m-1$ failure opportunities and
+decreases with $m$. The product has an interior maximum. The paper's choice of $m=4$ for
+$n=64$ (chunks of 16) sits near it for GPT-3.5-class models; **the optimum shifts with
+model strength**, so a weaker open model may prefer larger $m$ (smaller chunks). This is a
+concrete, cheap experiment to run on the HPC, and one of the more interesting things this
+codebase can measure.
 
 ---
 
-## 6. The latency–volume tradeoff, explained properly
+## 8. Best-of-$k$ and the role of exact scoring
 
-Section 6 is the paper's theoretical contribution and, in my view, the most elegant
-part. It took me a couple of passes to understand, so here it is carefully.
+### 8.1 With a perfect scorer
 
-### Definitions
+`Generate(k)` followed by `KeepBest(1)` succeeds iff at least one of $k$ i.i.d. samples is
+correct:
 
-- **Latency** of a thought `t` = number of hops from the input to `t` — the length of
-  the **shortest path**. *"How long did I wait for this answer?"*
-- **Volume** of a thought `t` = *"the number of preceding LLM thoughts that could have
-  impacted t"* — formally, **the number of thoughts from which there exists a path to
-  `t`**. *"How much accumulated reasoning informs this answer?"*
+$$
+q_k(p) \;=\; 1 - (1-p)^k
+$$
 
-You want **high volume** (a well-informed answer) at **low latency** (fast, parallel).
-These normally trade off against each other.
+The marginal value of the $k$-th sample is
 
-### The analysis
+$$
+\frac{\partial q_k}{\partial k} \;=\; -(1-p)^k \ln(1-p) \;=\; \Theta\!\left((1-p)^k\right)
+$$
 
-Fix total cost at Θ(N) thoughts for every scheme, with branching factor `k`:
+— **geometric decay**. Cost, meanwhile, is exactly linear in $k$. So the return per token
+falls off fast, which justifies the paper's modest $k=3$ on chunks and makes $k$ the first
+knob to turn down when the budget bites.
 
-| Scheme | Latency | Volume | Why |
-|---|---|---|---|
-| CoT | **N** | **N** | One long chain: the last thought sees all N, but you waited N steps |
-| CoT-SC | N/k | N/k | k parallel chains: each is k× shorter, **but each sees only its own chain** |
-| ToT | **log_k N** | **O(log_k N)** | A k-ary tree: fast, **but a leaf only sees its own root-to-leaf path** |
-| **GoT** | **log_k N** | **N** | ✅ **both** |
+![Best-of-k order statistics](docs/figures/theory_best_of_k.png)
 
-### The key realisations
+*Left: $q_k(p)$ for several $k$. Right: marginal gain of the $k$-th sample — geometric
+decay against linear cost.*
 
-**CoT-SC's hidden cost.** Splitting into `k` chains divides latency by `k` — but it
-divides volume by `k` too. The chains never talk to each other, so each answer is
-informed by only 1/k of the work done. You bought speed by throwing away information.
+### 8.2 With an imperfect scorer
 
-**ToT's hidden cost.** This is the one that surprised me. A tree with N nodes is fast
-to descend (log_k N). But look at a **leaf**: its ancestors are just the nodes on the
-single path back to the root — that's log_k N nodes. The *other* N − log_k N thoughts
-in the tree, all that exploration, **cannot influence it at all**, because there's no
-path from them to the leaf. ToT does a lot of work and then discards most of it.
+This is where exact local scoring earns its place. Suppose the scorer picks the truly-best
+candidate only with probability $\sigma$ (and otherwise picks at random). Then roughly
 
-**How GoT gets both.** The paper's construction: a complete k-ary tree joined at its
-leaves to a **mirrored k-ary tree with its edges reversed**.
+$$
+P(\text{success}) \;\approx\; \sigma\, q_k(p) \;+\; (1-\sigma)\, p
+$$
+
+As $\sigma \to 1$ we recover $q_k(p)$; as $\sigma \to 1/k$ (random choice) the benefit of
+generating $k$ candidates evaporates entirely. **Generating candidates is only worth
+paying for if you can tell which one is good.**
+
+For sorting, $\sigma = 1$ exactly, because the error-scope function is computable in
+closed form. This is the single largest reason the sorting pipeline works well, and it is
+why §14 treats "prefer local exact scoring" as a design rule rather than an optimisation.
+
+---
+
+## 9. The latency–volume theorem, with proof
+
+Section 6 of the paper is its theoretical contribution. I derive it here rather than
+quoting it.
+
+### 9.1 Definitions
+
+For a thought $t$ in reasoning graph $G$:
+
+$$
+L(t) \;=\; \min_{\,s \in \mathrm{Sources}(G)} \operatorname{dist}(s, t)
+\qquad\text{(latency: shortest path from an input)}
+$$
+
+$$
+V(t) \;=\; \bigl|\{\, u \in V \;:\; \exists \text{ a path } u \rightsquigarrow t \,\}\bigr|
+\qquad\text{(volume: ancestors)}
+$$
+
+Latency answers *how long did I wait*; volume answers *how much accumulated reasoning
+informs this answer*. We want high $V$ at low $L$. Fix total cost at $\Theta(N)$ thoughts
+for every scheme, with branching factor $k$.
+
+### 9.2 Scheme by scheme
+
+**CoT — a single chain of $N$ thoughts.**
+The final thought sits at the end: $L = N$. Every earlier thought is an ancestor:
+$V = N$.
+
+$$
+L_{\mathrm{CoT}} = N, \qquad V_{\mathrm{CoT}} = N
+$$
+
+**CoT-SC — $k$ disjoint chains from one root, each of length $N/k$.**
+Each chain is $k$ times shorter, so $L = N/k$. But the chains never interact: a thought's
+ancestors are only its own chain, so $V = N/k$.
+
+$$
+L_{\mathrm{CoT\text{-}SC}} = N/k, \qquad V_{\mathrm{CoT\text{-}SC}} = N/k
+$$
+
+Splitting divides latency by $k$ — *and divides volume by $k$ too*. Speed was bought by
+discarding information.
+
+**ToT — a complete $k$-ary tree with $N$ nodes.**
+Depth is $\log_k N$, so $L = \log_k N$. Now the crucial step: consider a **leaf** $t$. In a
+tree every node has in-degree $\le 1$, so the ancestor set of $t$ is exactly the unique
+path from the root to $t$:
+
+$$
+V_{\mathrm{ToT}}(t) \;=\; \bigl|\mathrm{path}(\mathrm{root} \to t)\bigr| \;=\; \Theta(\log_k N)
+$$
+
+$$
+L_{\mathrm{ToT}} = \log_k N, \qquad V_{\mathrm{ToT}} = O(\log_k N)
+$$
+
+**This is the punchline about trees.** A tree with $N$ nodes gives its leaf access to only
+$\log_k N$ of them. The other $N - \log_k N$ thoughts — nearly all the work — have **no
+path** to the answer and therefore cannot influence it. ToT explores a great deal and then
+throws almost all of it away.
+
+**GoT — a $k$-ary tree joined at its leaves to a mirrored $k$-ary tree with reversed
+edges.**
 
 ```
-       INPUT              ← fan out (the tree): latency log_k N
+       INPUT              ← fan out (tree half): depth log_k N
         /|\
-       / | \
-      ●  ●  ●
-     /|\ /|\ /|\
-    ● ● ● ● ● ● ●         ← N leaves, all explored in parallel
-     \|/ \|/ \|/
-      ●  ●  ●             ← fan back IN (the mirror): aggregation
-       \ | /
+       ● ● ●
+      /|\ /|\
+     ● ● ● ● ●            ← N leaves explored in parallel
+      \|/ \|/
+       ● ● ●              ← fan back IN: every node here is an AGGREGATION
         \|/
-       OUTPUT             ← every one of the N thoughts has a path here
+       OUTPUT
 ```
 
-The mirrored half is made entirely of **aggregations**. Because every leaf has a path
-to the output through them, volume = N. Because the mirror is also log_k N deep, total
-latency stays Θ(log_k N).
+*Latency.* Both halves have depth $\log_k N$, so $L = 2\log_k N = \Theta(\log_k N)$.
 
-> "GoT is the only scheme to come with both a low latency of log_k N and a high volume
-> N. This is enabled by the fact that GoT **harnesses aggregations of thoughts**, making
-> it possible to reach the final thought from any other intermediate thought."
+*Volume.* Take the output $t^*$. Let $u$ be any thought in the graph. In the fan-out half,
+$u$ lies on a root-to-leaf path, so there is a path $u \rightsquigarrow \ell$ to some leaf
+$\ell$. In the mirrored half, every leaf has a path $\ell \rightsquigarrow t^*$, because
+the mirror's edges are reversed and its aggregations converge on $t^*$. Concatenating,
+$u \rightsquigarrow t^*$ exists for **every** $u$. Hence
 
-**This is the whole argument for graphs in one sentence:** aggregation is what lets
-information flow back together after it fans out. A tree can only fan out.
+$$
+V_{\mathrm{GoT}}(t^*) \;=\; N
+$$
 
-### I verified this empirically
+$$
+\boxed{\;L_{\mathrm{GoT}} = \Theta(\log_k N), \qquad V_{\mathrm{GoT}} = N\;}
+$$
 
-`got/metrics.py` computes volume and latency by BFS over the actual graphs our runs
-produce. On a 32-element sorting problem:
+### 9.3 Table 2
 
-| Scheme | thoughts | aggregations | **volume** | **latency** |
+| Scheme | Latency | Volume | $V/L$ |
+|---|---|---|---|
+| CoT | $N$ | $N$ | $1$ |
+| CoT-SC | $N/k$ | $N/k$ | $1$ |
+| ToT | $\log_k N$ | $O(\log_k N)$ | $\Theta(1)$ |
+| **GoT** | $\log_k N$ | $N$ | $\Theta(N/\log_k N)$ |
+
+![Volume and latency](docs/figures/theory_volume_latency.png)
+
+*Table 2 plotted as continuous functions of $N$ at $k=4$. GoT is the only scheme whose
+volume-per-latency ratio grows with the budget.*
+
+**The one-sentence summary:** *aggregation is what lets information flow back together
+after it fans out; a tree can only fan out.*
+
+### 9.4 Empirical verification
+
+`got/metrics.py` computes $V$ and $L$ by BFS over the graphs our runs actually build. On a
+32-element sorting instance:
+
+| Scheme | thoughts | aggregations | $V$ | $L$ |
 |---|---|---|---|---|
 | IO | 2 | 0 | 1 | 1 |
 | CoT | 3 | 0 | 2 | 2 |
@@ -700,278 +832,442 @@ produce. On a 32-element sorting problem:
 | ToT | 9 | 0 | **6** | **6** |
 | **GoT** | 39 | **15** | **18** | **7** |
 
-Exactly the predicted pattern: GoT achieves **3× the volume of ToT for one extra hop of
-latency**, and it is the only scheme with a non-zero aggregation count. The theory is
-reproduced, not just cited.
+GoT achieves **3× ToT's volume for one extra hop**, and is the only scheme with non-zero
+aggregation count. The theory is reproduced, not merely cited.
+
+![GoT reasoning graph](docs/figures/graph_got.png)
+
+*An actual GoT reasoning graph from this implementation. Red vertices have
+$\deg^- > 1$ — the aggregations. The diamond shape is the fan-out/fan-in construction of
+§9.2 made concrete.*
 
 ---
 
-## 7. Glossary of every term
+## 10. The scoring functions — formal properties
 
-Alphabetical. These are the terms that must be understood to read the papers or this
-codebase.
+### 10.1 Sorting (§5.1)
+
+For input $a = [a_1 \ldots a_n]$ and output $b = [b_1 \ldots b_m]$:
+
+$$
+\mathrm{error\text{-}scope}(a,b) \;=\; X + Y
+$$
+
+$$
+X \;=\; \sum_{i=1}^{m-1} \operatorname{sgn}\!\bigl(\max(b_i - b_{i+1},\,0)\bigr),
+\qquad
+Y \;=\; \sum_{d=0}^{9} \Bigl|\; \bigl|\{b_p : b_p = d\}\bigr| - \bigl|\{a_q : a_q = d\}\bigr| \;\Bigr|
+$$
+
+**Reading $X$.** $\max(b_i-b_{i+1},0)$ is positive iff $b_i > b_{i+1}$, and $\operatorname{sgn}$
+collapses it to $1$. So
+
+$$
+X \;=\; \bigl|\{\, i : b_i > b_{i+1} \,\}\bigr|
+$$
+
+the count of **adjacent descents** — not total inversions. A list sorted except for one
+swapped neighbouring pair scores $X = 1$, whereas its inversion count would also be 1;
+but a reversed list scores $X = m-1$ where the inversion count is $\binom{m}{2}$. $X$ is
+therefore a *local* disorder measure, bounded by $m-1$.
+
+**Reading $Y$.** Writing $\mu_a, \mu_b$ for the multiset multiplicity functions,
+
+$$
+Y \;=\; \bigl\| \mu_b - \mu_a \bigr\|_1
+$$
+
+the $\ell_1$ distance between count vectors. This is exactly the failure the paper
+diagnosed: dropped elements and hallucinated duplicates.
+
+**Proposition.** $X + Y = 0 \iff b = \mathrm{sorted}(a)$.
+
+*Proof.* ($\Leftarrow$) If $b$ is $a$ sorted, it is non-decreasing so $X=0$, and it is a
+permutation of $a$ so $\mu_b = \mu_a$ and $Y=0$.
+($\Rightarrow$) $Y = 0$ gives $\mu_b = \mu_a$, so $b$ is a permutation of $a$ (in
+particular $m = n$). $X = 0$ gives $b_i \le b_{i+1}$ for all $i$, so $b$ is non-decreasing.
+A non-decreasing permutation of $a$ is unique and equals $\mathrm{sorted}(a)$. $\blacksquare$
+
+**Why both terms are necessary.** Neither alone is sound:
+
+| Failure | $X$ | $Y$ | Caught by |
+|---|---|---|---|
+| $b$ ascending but 3 elements dropped | 0 | 3 | $Y$ only |
+| $b$ has right multiset, wrong order | $>0$ | 0 | $X$ only |
+
+**Sign convention.** Our framework ranks by descending score, so we use the paper's
+positive form:
+
+$$
+\mathrm{score}(b) \;=\; \max\bigl(n - \mathrm{error\text{-}scope}(a,b),\; 0\bigr)
+$$
+
+The paper additionally clips with $\min(\mathrm{error\text{-}scope}, n)$ **for plotting
+only** ("to improve the clarity of plots, as some baselines result in large numbers of
+outliers"). We keep clipping optional and off by default for analysis.
+
+### 10.2 Set intersection (§5.2)
+
+For inputs $A, B$ and output $C$ (a *list*, possibly with repeats):
+
+$$
+\mathrm{error\text{-}scope} \;=\; X_1 + X_2 + X_d
+$$
+
+$$
+X_1 = \bigl|\,\mathrm{set}(C) \setminus (A \cap B)\,\bigr|,
+\qquad
+X_2 = \bigl|\,(A \cap B) \setminus \mathrm{set}(C)\,\bigr|,
+\qquad
+X_d = |C| - |\mathrm{set}(C)|
+$$
+
+$X_1 + X_2$ is the **symmetric difference** $\bigl|\mathrm{set}(C) \,\triangle\, (A\cap B)\bigr|$,
+a genuine metric on sets. $X_d$ counts duplicates, needed "because the LLM expresses the
+set as a list in natural language" — a list can repeat where a set cannot.
+
+By the same argument as above, $X_1+X_2+X_d = 0$ iff $C$ is exactly $A \cap B$ with no
+repeats.
+
+---
+
+## 11. Cost model
+
+On a cluster the budget is GPU-seconds, and GPU-seconds are dominated by **decoded
+tokens** (prefill is one parallel pass; decode is a sequential loop).
+
+### 11.1 Token cost per scheme
+
+For sorting, an answer listing $j$ digits costs $\Theta(j)$ tokens. Writing $c$ for tokens
+per element, $m$ chunks, branching $k$, aggregation attempts $k_a$, ToT depth $d$:
+
+$$
+\begin{aligned}
+C_{\mathrm{IO}} &= c\,n \\[2pt]
+C_{\mathrm{CoT}} &= 2\,c\,n \\[2pt]
+C_{\mathrm{CoT\text{-}SC}} &= k\,c\,n \\[2pt]
+C_{\mathrm{ToT}} &= k\,c\,n + (d-1)\,c\,n \\[2pt]
+C_{\mathrm{GoT}} &= \underbrace{m \cdot k \cdot c\,\tfrac{n}{m}}_{\text{chunk sorts}}
+ \;+\; \underbrace{k_a \sum_{\ell=1}^{\log_2 m} \frac{m}{2^{\ell}} \cdot c\,\frac{2^{\ell} n}{m}}_{\text{merge tree}}
+ \;=\; k\,c\,n \;+\; k_a\, c\, n \log_2 m
+\end{aligned}
+$$
+
+The merge sum is worth noting: at level $\ell$ there are $m/2^\ell$ merges each producing
+$2^\ell n/m$ elements, so **every level costs the same $c\,n$** — a classic merge-sort
+property. Hence the clean $\log_2 m$ factor.
+
+$$
+\frac{C_{\mathrm{GoT}}}{C_{\mathrm{IO}}} \;=\; k + k_a \log_2 m
+$$
+
+With the paper's $k=3$, $k_a=10$, $m=4$: a factor of $3 + 20 = 23$. **The $k_a \log_2 m$
+term dominates**, which identifies `aggregation_attempts` as the first knob to turn.
+
+![Cost model](docs/figures/theory_cost_quality.png)
+
+*Left: decode cost against input length. Right: relative cost against $k_a$ at $n=64$ —
+the dominant GoT cost knob.*
+
+### 11.2 Throughput, and why batching matters
+
+Wall-clock GPU time is
+
+$$
+T_{\mathrm{GPU}} \;\approx\; \frac{C_{\text{decode}}}{\tau(\beta)} \;+\; \frac{C_{\text{prefill}}}{\tau_{\text{pre}}}
+$$
+
+where $\tau(\beta)$ is throughput at batch size $\beta$. The critical fact:
+$\tau$ **increases steeply with $\beta$** until the GPU saturates, because decoding is
+memory-bandwidth-bound and a larger batch amortises each weight read across more
+sequences. Serving prompts one at a time leaves a large GPU mostly idle.
+
+This is why the implementation batches (see §14.8): one `Generate` holding four chunk
+thoughts submits $4k$ sequences in a single call instead of four calls of $k$.
+
+Prefix caching gives a second saving. All prompts for a task share a long identical
+prefix $P$ (instructions + few-shot example), so with caching
+
+$$
+C_{\text{prefill}} \;=\; |P| + \sum_i |u_i| \quad\text{instead of}\quad \sum_i \bigl(|P| + |u_i|\bigr)
+$$
+
+where $u_i$ is the instance-specific tail. With $|P| \gg |u_i|$ this is close to an
+$N$-fold reduction in prefill.
+
+### 11.3 Pricing a job before submitting it
+
+`scripts/estimate_cost.py` runs the full GoO on the free mock backend — identical control
+flow, identical prompt counts, no GPU — and projects tokens, batches and GPU-seconds. The
+*counts are exact*; only $\tau$ is modelled. Example for 100 instances of `sorting_64`
+on an 8B model:
+
+| scheme | $k_a$ | batches | sequences | decode tokens | GPU time |
+|---|---|---|---|---|---|
+| io | – | 100 | 100 | 7,200 | 0.1 min |
+| cot | – | 200 | 200 | 14,400 | 0.1 min |
+| cot_sc | – | 100 | 300 | 21,600 | 0.2 min |
+| tot | – | 300 | 500 | 36,000 | 0.3 min |
+| **got** | **10** | 300 | 4,200 | 192,960 | **1.5 min** |
+| got | 5 | 300 | 2,700 | 113,760 | 0.9 min |
+| got | 3 | 300 | 2,100 | 82,080 | 0.6 min |
+
+The whole comparison is single-digit minutes of compute. On a cluster the *allocation*
+(model load, queue, node hold) will dominate the bill, not the inference — so the
+practical advice is to batch many configurations into one job rather than submitting many
+short ones.
+
+---
+
+## 12. Glossary
 
 | Term | Meaning |
 |---|---|
-| **Aggregation** | GoT transformation merging k thoughts into 1. Creates a vertex with **in-degree > 1**. Impossible in a tree. The defining feature of GoT. |
-| **Backtracking** | Abandoning an unpromising branch and returning to an earlier state. Introduced by ToT. |
-| **Beam search** | Keeping the best `b` candidates at each level. ToT's BFS is beam search with beam width `b`. |
-| **Branching factor (k)** | How many candidates to generate from one thought. |
-| **Chain of Thought (CoT)** | A series of intermediate natural-language reasoning steps between input and output. |
-| **CoT-SC** | Self-Consistency: sample k chains, take the most frequent answer. |
-| **DAG** | Directed Acyclic Graph. The actual shape of a GoT reasoning graph. |
-| **Emergent ability** | A capability absent in small models that appears above a scale threshold. CoT is one; it needs ≳10B params. |
-| **Error scope** | GoT's task-specific error metric. For sorting, `X + Y`. |
-| **Few-shot / ICL** | In-context learning: giving examples in the prompt instead of fine-tuning. |
-| **GoO** | **Graph of Operations**. The **static** execution plan — a DAG of operations, built before the run. |
-| **GRS** | **Graph Reasoning State**. The **dynamic** state — the thoughts actually produced, with scores and validity. |
-| **Hallucinated rationale** | Plausible-sounding but wrong reasoning. Documented in MM-CoT for <1B models; dangerous because later steps trust it. |
-| **In-degree** | Number of incoming edges. **In-degree > 1 ⟺ aggregation ⟺ genuinely a graph.** |
-| **Latency** | Hops from input to a thought (shortest path). |
-| **Multiset** | A set allowing duplicates. Sorting must preserve the input multiset — term Y of the score. |
-| **Parser** | Module extracting structured thought state from raw LLM text. |
-| **Prompter** | Module building prompt strings; owns all task-specific wording. |
-| **Refinement** | GoT transformation improving a thought in place; formally a self-loop `(v, v)`. |
-| **Score / Evaluator E** | `E(v, G, p_θ) → ℝ`. May be exact Python (sorting) or an LLM query (document merging). |
-| **Ranking R** | `R(G, p_θ, h)` → the h best thoughts. Usually just top-h by score. |
-| **State (ToT)** | `s = [x, z₁…ᵢ]` — input plus thoughts so far. A partial solution. |
-| **System 1 / System 2** | Fast-automatic vs slow-deliberate cognition. ToT's framing for what LLMs lack. |
-| **Thought** | A coherent unit of intermediate reasoning; a **vertex** in GoT. |
-| **Thought decomposition** | Choosing how big one thought should be. Too small → unevaluable; too big → incoherent. |
-| **Volume** | Number of thoughts with a path *to* a given thought. How much reasoning informs it. |
-| **X (sorting)** | Count of adjacent descents — measures sortedness. |
-| **Y (sorting)** | Sum of per-digit frequency mismatches — measures multiset preservation. |
+| **Aggregation** | GoT transformation merging $k$ thoughts into 1; creates $\deg^-(v)>1$. Impossible in a tree. |
+| **Backtracking** | Abandoning an unpromising branch; introduced by ToT. |
+| **Beam search** | Keeping best $b$ candidates per level; ToT's BFS. |
+| **Branching factor $k$** | Candidates generated per thought. |
+| **CoT** | Chain of Thought: intermediate reasoning steps in the prompt. |
+| **CoT-SC** | Self-Consistency: $k$ chains, majority vote. |
+| **DAG** | Directed Acyclic Graph — the shape of a GoT reasoning graph. |
+| **Emergent ability** | Capability absent below a scale threshold; CoT needs $\gtrsim$10B params. |
+| **Error scope** | Task-specific error metric; $X+Y$ for sorting. |
+| **Few-shot / ICL** | In-context learning: examples in the prompt, no weight updates. |
+| **GoO** | Graph of Operations — the **static** execution plan. |
+| **GRS** | Graph Reasoning State — the **dynamic** thoughts produced. |
+| **Hallucinated rationale** | Plausible but wrong reasoning; dangerous because later steps trust it. |
+| **In-degree $\deg^-$** | Incoming edges. $\deg^->1 \iff$ aggregation $\iff$ genuinely a graph. |
+| **Latency $L(t)$** | Shortest-path hops from input to $t$. |
+| **Multiset** | Set allowing duplicates; sorting must preserve it (term $Y$). |
+| **Parser** | Extracts structured thought state from raw LLM text. |
+| **Prefill / decode** | Parallel pass over the prompt vs. sequential token generation. Decode dominates cost. |
+| **Prefix caching** | Reusing the KV cache of a shared prompt prefix. |
+| **Prompter** | Builds prompt strings; owns task-specific wording. |
+| **Refinement** | Improving a thought in place; formally a self-loop $(v,v)$. |
+| **Score $\mathcal{E}$** | $\mathcal{E}(v,G,p_\theta)\to\mathbb{R}$; exact Python (sorting) or LLM query (merging). |
+| **Ranking $\mathcal{R}$** | Top-$h$ thoughts by score. |
+| **State (ToT)** | $s=[x,z_{1\ldots i}]$ — a partial solution. |
+| **System 1 / 2** | Fast-automatic vs slow-deliberate cognition; ToT's framing. |
+| **Thought** | A coherent unit of intermediate reasoning; a vertex in $G$. |
+| **Volume $V(t)$** | Number of thoughts with a path *to* $t$. |
+| **$X$ (sorting)** | Count of adjacent descents — sortedness. |
+| **$Y$ (sorting)** | $\ell_1$ distance between multiset count vectors. |
 
 ---
 
-## 8. How the papers map onto this codebase
+## 13. Paper → code map
 
-Every framework concept has exactly one home in the code:
-
-| Paper concept | Section | Implementation |
+| Concept | Section | Implementation |
 |---|---|---|
 | Thought (vertex) | GoT 3.1 | [`got/thought.py`](got/thought.py) — `Thought` |
 | Edge (dependency) | GoT 3.1 | `Thought.add_predecessor()` |
-| Generation transformation | GoT 3.2 | [`got/operations.py`](got/operations.py) — `Generate` |
-| **Aggregation transformation** | GoT 3.2 | [`got/operations.py`](got/operations.py) — **`Aggregate`** |
-| Refinement transformation | GoT 3.2 | [`got/operations.py`](got/operations.py) — `Improve` |
-| Evaluator `E` | GoT 3.3 | [`got/operations.py`](got/operations.py) — `Score` |
-| Ranking `R` | GoT 3.3 | [`got/operations.py`](got/operations.py) — `KeepBest` |
-| Prompter | GoT 4.1 | [`got/prompter.py`](got/prompter.py) — `AbstractPrompter` |
-| Parser | GoT 4.2 | [`got/prompter.py`](got/prompter.py) — `AbstractParser` |
+| Generation | GoT 3.2 | [`got/operations.py`](got/operations.py) — `Generate` |
+| **Aggregation** | GoT 3.2 | **`Aggregate`, `PairwiseAggregate`** |
+| Refinement | GoT 3.2 | `Improve` |
+| Evaluator $\mathcal{E}$ | GoT 3.3 | `Score` |
+| Ranking $\mathcal{R}$ | GoT 3.3 | `KeepBest`, `KeepBestPerGroup` |
+| Prompter | GoT 4.1 | [`got/prompter.py`](got/prompter.py) |
+| Parser | GoT 4.2 | [`got/prompter.py`](got/prompter.py) |
 | Scoring & Validation | GoT 4.3 | `Score` + `KeepValid` + `state["valid"]` |
-| Controller | GoT 4.4 | [`got/controller.py`](got/controller.py) — `Controller` |
-| **GoO** (static plan) | GoT 4.5 | The `Operation` DAG built in `got/tasks/*/graphs.py` |
-| **GRS** (dynamic state) | GoT 4.5 | `Operation.thoughts` + `Controller.all_thoughts()` |
-| Sorting score `X + Y` | GoT 5.1 | [`got/tasks/sorting/scoring.py`](got/tasks/sorting/scoring.py) |
-| Sorting GoO (Figure 4) | GoT 5.1 | [`got/tasks/sorting/graphs.py`](got/tasks/sorting/graphs.py) — `got_sorting_goo` |
+| Controller | GoT 4.4 | [`got/controller.py`](got/controller.py) |
+| **GoO** (static) | GoT 4.5 | the `Operation` DAG in `got/tasks/*/graphs.py` |
+| **GRS** (dynamic) | GoT 4.5 | `Operation.thoughts`, `Controller.all_thoughts()` |
+| Sorting score $X+Y$ | GoT 5.1 | [`got/tasks/sorting/scoring.py`](got/tasks/sorting/scoring.py) |
+| Sorting GoO (Fig. 4) | GoT 5.1 | `got_sorting_goo` |
 | Set intersection | GoT 5.2 | [`got/tasks/set_intersection/`](got/tasks/set_intersection/) |
 | Latency & Volume | GoT 6 | [`got/metrics.py`](got/metrics.py) |
-| Table 2 bounds | GoT 6 | `metrics.theoretical_bounds()` |
-| ToT BFS/beam | ToT Alg. 1 | `tot_goo()` — refine + score + `KeepBest(b)` per level |
-| CoT-SC k chains | CoT-SC | `cot_sc_goo()` — `Generate(k)` + `KeepBest(1)` |
-| CoT chain | CoT | `cot_goo()` — `Generate(1)` + `Improve` |
+| Table 2 | GoT 6 | `metrics.theoretical_bounds()` |
+| ToT BFS/beam | ToT Alg. 1 | `tot_goo()` |
+| CoT-SC | CoT-SC | `cot_sc_goo()` |
+| Cost model (§11) | — | [`scripts/estimate_cost.py`](scripts/estimate_cost.py) |
 
 ---
 
-## 9. Implementation decisions and why I made them
+## 14. Implementation decisions
 
-These are choices where the paper left room, and I want the reasoning on record.
+### 14.1 Three interchangeable backends
 
-### 9.1 Three interchangeable LLM backends
-
-**Constraint:** this laptop has 7.3 GB RAM (3.5 GB visible to WSL), 8 cores, and an
-**AMD integrated GPU — no CUDA**. A 7B model in fp16 needs ~14 GB. It cannot run here.
-
-**Decision:** put every model call behind `AbstractLanguageModel` and provide:
+Hardware: 7.3 GB RAM (3.5 GB in WSL), 8 cores, **AMD integrated GPU — no CUDA**. A 7B
+model in fp16 needs $\approx 2 \times 7\times10^9 = 14$ GB. It cannot run here.
 
 | Backend | Where | Model | Purpose |
 |---|---|---|---|
 | `MockLM` | laptop | none | validate graph logic, free and instant |
 | `LlamaCppLM` | laptop | Qwen2.5-1.5B Q4 (~1 GB) | real-but-small end-to-end check |
-| `HFLM` / `VLLMLM` | HPC | Llama-3.1-8B/70B | paper-comparable numbers |
+| `HFLM`/`VLLMLM` | HPC | Llama-3.1-8B/70B | paper-comparable numbers |
 
-The same task code runs on all three. Only a config flag changes.
+### 14.2 The mock must be fallible, not an oracle
 
-### 9.2 The mock backend must be *fallible*, not an oracle
+A perfect mock would score 100% for every scheme and prove nothing. It must fail **the way
+a real LLM fails**. So `MockLM` corrupts with modes matching the score's penalties (drop
+and duplicate break $Y$; neighbour swap breaks $X$), **degrades with length** per the
+$e^{-\lambda n}$ model of §7, and treats merging ($\times 0.6$) and refinement
+($\times 0.5$) as easier than sorting — which is precisely *why* decomposition helps.
 
-This is the subtlest design decision in the project.
+Setting `error_rate=0` gives a perfect oracle, isolating framework bugs from model errors.
+There is a test for exactly that.
 
-A mock that sorts perfectly would make every scheme score 100% and prove nothing. The
-mock must **fail the way a real LLM fails**, or the pipeline isn't being tested.
+**Honest limitation:** MockLM validates control flow and bookkeeping only. Mock numbers
+are **not** paper-comparable.
 
-So `MockLM`:
-- corrupts answers with modes matching the score's penalties — **drop** and **duplicate**
-  (break term Y), **swap neighbours** (break term X);
-- **degrades with input length** (`length_sensitivity`), reproducing the paper's core
-  observation that LLMs fail past a certain length;
-- treats **merging as easier than sorting** (×0.6 error) and **refinement as easier
-  still** (×0.5) — which is *why* the merge-sort decomposition helps at all;
-- is **seeded**, so runs are exactly reproducible — something no real LLM offers.
+### 14.3 Structural steps do not call the LLM
 
-Setting `error_rate=0.0` turns it into a perfect oracle, which isolates framework bugs
-from model errors. There's a test for exactly that
-([`test_zero_error_rate_is_a_perfect_oracle`](tests/test_graph.py)).
+Splitting a 64-element list into 4 chunks is deterministic Python. Spending a call on it
+adds cost *and* a failure mode for zero benefit — a model that miscounts while chunking
+corrupts $Y$ before reasoning starts. `Prompter.build()` returns `None` to mark a step
+local; verified free by `test_split_is_local_and_free`.
 
-**Honest limitation:** MockLM validates control flow and bookkeeping only. It says
-nothing about prompt quality. **Mock numbers are not paper-comparable.**
+### 14.4 Refinement as a fresh vertex, not a literal self-loop
 
-### 9.3 Structural steps don't call the LLM
+The paper defines refinement as $E^+=\{(v,v)\}$. A literal self-loop makes $G$ cyclic,
+breaking topological sort, BFS volume computation, and layout. We materialise the refined
+result as a new vertex with the original as predecessor: acyclic, same provenance, same
+information content. Bookkeeping, not behaviour.
 
-Splitting a 64-element list into 4 chunks is deterministic Python. Spending an LLM call
-on it would add cost *and* a failure mode for zero benefit — a model that miscounts
-while chunking corrupts term Y before reasoning even starts.
+### 14.5 Scoring separate from validation
 
-**Mechanism:** `Prompter.build()` returns `None` to mark a step as local, and the
-operation routes to `Parser.parse_local()` instead. Verified free by
-[`test_split_is_local_and_free`](tests/test_graph.py).
+A thought can be well-formed but poor (valid, low score) or malformed (invalid — prose
+where a list was required). Separating them lets `KeepValid` drop garbage before it
+pollutes the ranking. This matters far more with open 1.5B models than with GPT-4.
 
-This is faithful to the paper — Figure 4 shows the first Generate as a structural split.
+### 14.6 Defensive parsing
 
-### 9.4 Refinement as a fresh vertex, not a literal self-loop
+`extract_list()` takes the **last** bracketed list — chatty models restate the input first.
+Code fences are stripped. A parse failure yields an invalid thought, never an exception:
+one bad response must not abort a multi-hour HPC job.
 
-The paper defines refinement as `E⁺ = {(v, v)}` — a genuine self-loop. I materialise the
-refined result as a **new vertex whose predecessor is the original**.
+### 14.7 Five schemes, one engine
 
-**Why:** a literal self-loop makes the graph cyclic, which breaks topological sorting,
-BFS-based volume computation, and visualisation. Representing it as a new vertex keeps
-the graph acyclic while preserving the full provenance chain. The distinction is
-bookkeeping, not behaviour — the information content is identical.
+`io`, `cot`, `cot_sc`, `tot`, `got` share Controller, backend, prompts and scorer, and
+**differ only in graph topology**. Any measured difference is attributable to structure
+alone. Tests assert the four baselines have zero aggregations and GoT has some.
 
-### 9.5 Scoring is separate from validation
+### 14.8 Batching, and why the GoO shape had to change
 
-A thought can be **well-formed but poor** (valid, low score) or **malformed entirely**
-(invalid — the model returned prose where a list was required).
+The first version gave each chunk its own `Selector → Generate → Score → KeepBest` chain.
+The reasoning *graph* was right, but the cost was not: the Controller runs operations one
+at a time, so four single-input `Generate`s meant four serial calls each submitting a
+batch of one.
 
-Keeping these separate lets `KeepValid` discard garbage before it pollutes the ranking.
-This matters far more with open 1.5B models than with the paper's GPT-3.5/4, which
-almost always return parseable output.
+Folding them into a single `Generate` over all chunk thoughts, followed by
+`KeepBestPerGroup`, produces **identical thoughts and edges** while collapsing 4 serial
+calls into 1 batched call of 4 prompts ($4k$ sequences). Same for `PairwiseAggregate` per
+merge level. Measured on 64-element sorting: GoT went from **7 GPU round trips to 3**,
+with 12 concurrent sequences in the first batch instead of 3.
 
-### 9.6 Defensive parsing everywhere
-
-`extract_list()` takes the **last** bracketed list in the response, not the first —
-chatty models restate the input before answering. Code fences are stripped. A parse
-failure produces an invalid thought, never an exception: **one bad response must not
-abort a multi-hour HPC job.** `run_benchmark.py` wraps each instance in try/except for
-the same reason.
-
-### 9.7 Five schemes sharing one engine
-
-`io`, `cot`, `cot_sc`, `tot`, `got` all use the same Controller, backend, prompts and
-scorer. **They differ only in graph topology.** That's a deliberate experimental design:
-any measured difference is attributable to structure alone, not to prompt or
-implementation differences. Tests assert that the four baselines contain **zero**
-aggregations and that GoT contains some.
+Per-step token budgets matter for the same reason. A 16-element chunk answer needs
+$\approx 2\times16+32 = 64$ tokens; leaving the global 1024 default in place risks paying
+16× for nothing when a model fails to emit a stop token.
 
 ---
 
-## 10. Bugs found during development (and what they taught me)
+## 15. Bugs found, and what they taught me
 
-Recording these because each one exposed something real about the method.
-
-### Bug 1 — Few-shot examples leaking into answers
+### Bug 1 — few-shot examples leaking into answers
 
 **Symptom:** a 32-element input produced a **205-element** output.
+**Cause:** `MockLM` scraped *every* bracketed list from the prompt, including the
+16-element few-shot example, and merged them all.
+**Fix:** prompts place the real payload last; the mock takes the last $N$ lists.
+**Lesson:** mirrors a real failure mode — instruction-tuned models do sometimes copy
+exemplars into answers. Taking the **last** match in `extract_list()` guards the real
+version.
 
-**Cause:** `MockLM` scraped *every* bracketed list from the prompt — including the
-16-element list in the **few-shot example** — and merged them all into its answer.
+### Bug 2 — aggregated thoughts scored against the wrong target ★
 
-**Fix:** all prompt templates place the real payload **last**, so the mock takes the
-last *N* lists, where *N* depends on the operation (`_payload_lists`).
+**Symptom:** GoT scored **0/32** while visibly emitting a near-perfect sorted list.
+**Cause:** `sorting_score` compares `current` against `original`, and a merged thought
+inherited `original` from **only its first parent** — so a 32-element result was compared
+against a 16-element chunk. $Y$ then reported ~16 spurious elements and the score floored.
+**Fix:** define `original` recursively:
 
-**Lesson:** this is a mock-specific bug, but it mirrors a real failure mode —
-instruction-tuned models genuinely do sometimes copy few-shot exemplars into their
-answers. Taking the **last** match in `extract_list()` guards against the real version.
+$$
+\mathrm{orig}(v) = \begin{cases}
+\text{the chunk} & v \text{ from split} \\
+\mathrm{orig}(\mathrm{parent}(v)) & v \text{ from sort/refine} \\
+\mathrm{orig}(p_1) \uplus \mathrm{orig}(p_2) & v \text{ from aggregation}
+\end{cases}
+$$
 
-### Bug 2 — Aggregated thoughts scored against the wrong target ★
+with $\uplus$ multiset union. At the root of the merge tree this reconstitutes the full
+input multiset.
 
-**Symptom:** GoT scored **0/32** while visibly producing a near-perfect sorted list.
+**Lesson — the important one:** in a tree, "what should I contain?" has one answer from one
+parent. **In a graph, provenance must be combined across all parents.** Aggregation changes
+not just topology but how metadata propagates. This bug class *cannot occur* in CoT or ToT.
 
-**Cause:** `sorting_score` compares `current` against `original`. For a merged thought I
-was inheriting `original` from **only the first parent** — so a 32-element merged result
-was being compared against a 16-element chunk. Term Y then reported ~16 "extra"
-elements and the score floored at zero.
+### Bug 3 — aggregation silently discarding half its input
 
-**Fix:** define `original` **recursively down the graph**:
-```
-chunk from split       →  original = that chunk
-sort of a chunk        →  original = parent's original
-merge of A and B       →  original = A.original + B.original
-```
-At the root of the merge tree, the concatenation reconstitutes the full input multiset.
-
-**Lesson — and this is the important one:** in a tree, "what was I supposed to produce?"
-has one answer inherited from one parent. **In a graph, provenance must be combined from
-all parents.** Aggregation doesn't just change the topology; it changes how metadata
-propagates. This bug is *specific to graphs* and could not occur in CoT or ToT.
-
-### Bug 3 — Aggregation silently discarding half its input
-
-**Symptom:** on set intersection, GoT scored **worse than the IO baseline** (error 13.60
-vs 3.90) — the opposite of the expected result.
-
+**Symptom:** on set intersection GoT scored **worse than IO** (error 13.60 vs 3.90).
 **Cause:** the union prompt contains neither "intersect" nor "merge", so `MockLM` fell
-through to its generic "sort one list" branch, read only **one** payload list, and threw
-the other away. Every aggregation lost half its data; across a 3-level merge tree only
-~1/4 of elements survived.
-
+through to its generic single-list branch and read only one of the two payload lists.
+Across a 3-level tree only $\approx 1/4$ of elements survived.
 **Fix:** an explicit union branch, tested before the generic ones.
+**Result:** error **3.90 → 1.10 ($-72\%$)**, accuracy **0% → 40%**.
+**Lesson:** a silent fallback is worse than a crash. With a *real* model the analogous
+failure — misreading an aggregation prompt and echoing one input — would be equally
+silent. This is exactly why `Score` sits after every `Aggregate`: an aggregation that
+dropped half its input scores badly and gets pruned.
 
-**Lesson:** a silent fallback is worse than a crash. And it's a reminder that with
-*real* models the analogous failure — a model that misreads the aggregation prompt and
-returns only one input — would be equally silent. This is precisely why `Score` sits
-after every `Aggregate`: an aggregation that dropped half its input scores badly and
-gets pruned.
+### Bug 4 — grouping metadata lost across the parser (found during the batching refactor)
 
-After the fix: **error 1.10 vs 3.90 (−72%), accuracy 40% vs 0%.**
+**Symptom:** after folding the per-chunk chains into one batched `Generate`, GoT returned
+a correctly sorted list of only **a quarter** of the input.
+**Cause:** `KeepBestPerGroup` ranks within `chunk_index`, but `SortingParser.parse()`
+built a fresh state dict and dropped that key. All sorted chunks fell into one group, so
+`KeepBestPerGroup(n=1)` kept a single chunk and discarded the other three.
+**Fix:** carry grouping keys (`chunk_index`, `_group`) through every parse.
+**Lesson:** a cost optimisation that changes *how work is grouped* silently changes
+*what identifies a group*. The unit test asserting a perfect oracle reaches
+`sorted(numbers)` caught it immediately — which is the argument for having that test at
+all.
 
 ---
 
-## 11. What I verified, and what I did not
-
-Being explicit about this, because a replication's value depends on it.
+## 16. What I verified, and what I did not
 
 ### Verified ✅
 
-- **The formal structures.** Volume, latency, in-degree, and the DAG property are
-  computed on real graphs and unit-tested (46 tests passing).
-- **Table 2's qualitative claim.** GoT achieves **3× ToT's volume for one extra hop** on
-  a real 32-element run. The only scheme with aggregations.
-- **The scoring formulae.** `X + Y` for sorting and `X1 + X2 + Xd` for intersection are
-  implemented verbatim from the paper and tested against hand-computed cases.
-- **The relative ordering of schemes.** On mock runs: IO 26 < CoT 28 < CoT-SC 29 <
-  ToT 30 < **GoT 31** (score out of 32) — the paper's predicted ordering.
-- **That aggregation is what does the work.** Set intersection: −72% error vs the IO
-  baseline; the whole gain vanished when aggregation was broken (Bug 3).
-- **Framework correctness independent of model quality.** With `error_rate=0.0` the
-  pipeline reaches a provably perfect answer.
+- **Formal structures.** Volume, latency, in-degree and the DAG property computed on real
+  graphs; 46 tests passing.
+- **Table 2 qualitatively.** GoT reaches **3× ToT's volume for one extra hop**; the only
+  scheme with aggregations.
+- **Scoring formulae.** $X+Y$ and $X_1+X_2+X_d$ implemented verbatim and tested against
+  hand-computed cases, including the $X+Y=0 \iff$ correct proposition of §10.1.
+- **Relative ordering.** Mock runs give IO 26 < CoT 28 < CoT-SC 29 < ToT 30 < **GoT 31**
+  (score out of 32) — the paper's predicted ordering.
+- **Aggregation does the work.** Set intersection: $-72\%$ error vs IO; the entire gain
+  vanished when aggregation broke (Bug 3).
+- **Framework correctness independent of model quality.** With `error_rate=0` the pipeline
+  reaches a provably perfect answer.
+- **Cost model counts.** Batches and sequence counts from `estimate_cost.py` match what
+  the runner actually issues.
 
 ### NOT verified ⚠️
 
-- **Absolute quality numbers.** The mock backend is not a language model. The "62%
-  improvement over ToT" claim **cannot** be confirmed without real LLM runs on the HPC.
-  Mock accuracy figures are diagnostics, not results.
-- **The cost claim.** The paper reports GoT **reducing** cost >31% vs ToT. In our runs
-  GoT uses *more* tokens than our ToT baseline (4995 vs 724 per instance). This is not a
-  contradiction — our ToT baseline is deliberately lean (beam width 1, depth 3), while
-  the paper's ToT configuration is much wider. A fair cost comparison requires matching
-  the paper's ToT budget, which is HPC work.
-- **Prompt quality.** Every prompt is untested against a real model. Small open models
-  are far more format-sensitive than GPT-4, and prompt iteration on the HPC should be
-  expected.
-- **Keyword counting and document merging.** Datasets are generated and MockLM supports
-  keyword counting, but the GoO builders for these two tasks are not yet written.
+- **Absolute quality numbers.** The mock is not a language model. The "62% over ToT" claim
+  **cannot** be confirmed without real LLM runs. Mock accuracy is a diagnostic, not a
+  result.
+- **The cost claim.** The paper reports GoT *reducing* cost >31% vs ToT; our GoT uses more
+  tokens than our ToT baseline, because our ToT is deliberately lean ($b=1$, $d=3$) while
+  the paper's is much wider. A fair comparison needs the paper's ToT budget.
+- **Throughput $\tau$.** Modelled, not measured. Calibrate from a pilot run before trusting
+  the money column of §11.3.
+- **Prompt quality.** Untested against a real model. Small open models are far more
+  format-sensitive than GPT-4; expect prompt iteration on the HPC.
+- **Keyword counting and document merging.** Datasets generated and MockLM supports
+  keyword counting, but the GoO builders are not yet written.
+- **The optimal $m$ (§7.4).** Predicted to shift with model strength; not yet measured.
 
-### The honest summary
+### Summary
 
-**What this project has established:** a correct, tested, well-documented implementation
-of the Graph of Thoughts framework, which demonstrably builds the graph structures the
-paper describes, reproduces its theoretical latency–volume result empirically, and runs
-identically on a laptop and an HPC cluster with open-source models.
+**Established:** a correct, tested, documented implementation of the GoT framework that
+provably builds the graph structures the paper describes, reproduces its latency–volume
+theorem empirically, prices its own HPC jobs, and runs identically on a laptop and a
+cluster with open-source models.
 
-**What remains:** running it against a real open-weights model at scale to obtain
-quality numbers comparable to the paper's. Everything needed for that is in place —
-`scripts/slurm/`, the vLLM backend, and the datasets.
+**Remaining:** running it against a real open-weights model at scale. Everything needed is
+in place.
 
 ---
 
@@ -989,3 +1285,4 @@ quality numbers comparable to the paper's. Everything needed for that is in plac
    [code](https://github.com/spcl/graph-of-thoughts)
 5. Wang, X. et al. **Self-Consistency Improves Chain of Thought Reasoning in Language
    Models.** ICLR 2023. [arXiv:2203.11171](https://arxiv.org/abs/2203.11171)
+6. Newell, A. & Simon, H. **Human Problem Solving.** Prentice-Hall, 1972.

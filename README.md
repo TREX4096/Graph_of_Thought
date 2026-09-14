@@ -104,7 +104,7 @@ works everywhere. Pick a backend with `--backend`:
 > *control structure*, not a language model — and that can be tested exactly without
 > one, provided the fake model fails the way a real one does. `MockLM` drops, duplicates
 > and misorders elements, and **degrades with input length**, reproducing the paper's
-> motivating failure. See [explanation.md §9.2](explanation.md#92-the-mock-backend-must-be-fallible-not-an-oracle).
+> motivating failure. See [explanation.md §14.2](explanation.md#142-the-mock-must-be-fallible-not-an-oracle).
 >
 > **Mock numbers are diagnostics, not results.** Paper-comparable quality figures
 > require a real model on the HPC.
@@ -157,6 +157,40 @@ Model choice by GPU memory:
 > Llama models are **gated** on HuggingFace — accept the licence, then
 > `huggingface-cli login`. **Qwen models are ungated** and need no token; prefer them
 > if you hit access problems.
+
+---
+
+## Estimating HPC cost before you submit
+
+GPU hours are the budget. Price a configuration **before** queueing it:
+
+```bash
+python scripts/estimate_cost.py --data data/sorting/sorting_64.csv \
+    --limit 100 --model-size 8b --aggregation-attempts 10 5 3
+```
+
+```
+scheme     agg_k  batches     seqs   decode tok    GPU time
+-------------------------------------------------------------
+io             -      100      100        7,200     0.1 min
+cot            -      200      200       14,400     0.1 min
+cot_sc         -      100      300       21,600     0.2 min
+tot            -      300      500       36,000     0.3 min
+got           10      300    4,200      192,960     1.5 min
+got            5      300    2,700      113,760     0.9 min
+got            3      300    2,100       82,080     0.6 min
+```
+
+It runs the **real Graph of Operations on the free mock backend**, so prompt and batch
+counts are *exact*; only throughput is modelled. Add `--gpu-hour-rate` for a money column.
+
+Cost knobs, in order of impact: `--aggregation-attempts` (dominant, it is the
+`k_a log2 m` term), then `--limit`, then `--branching-factor`, then input length.
+
+> A full 100-instance, 5-scheme run on 64-element sorting is **single-digit minutes of
+> GPU compute**. On a cluster the allocation overhead (model load, queue, node hold) will
+> dominate the bill, so batch many configurations into one job rather than submitting
+> many short ones.
 
 ---
 
@@ -276,7 +310,7 @@ not linguistic ability. Our GoT also uses *more* tokens than our ToT baseline, w
 the paper reports a cost *reduction* — because our ToT baseline is deliberately lean.
 A fair cost comparison needs the paper's wider ToT configuration on HPC.
 
-See [explanation.md §11](explanation.md#11-what-i-verified-and-what-i-did-not) for the
+See [explanation.md §16](explanation.md#16-what-i-verified-and-what-i-did-not) for the
 full honest accounting.
 
 ---

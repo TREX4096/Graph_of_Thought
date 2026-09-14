@@ -8,7 +8,7 @@ This module is where the paper's central claim becomes testable. We build
     IO      Input -> one LLM call -> answer.              (no intermediate thoughts)
     CoT     Input -> one call, reasoning in-context.      (a chain)
     CoT-SC  Input -> k independent chains -> pick best.   (k chains, no cross-talk)
-    ToT     Input -> split -> branch k, prune, descend.   (a tree)
+    ToT     Input -> branch, score, prune, refine.        (a tree)
     GoT     Input -> split -> sort chunks -> AGGREGATE.   (a DAG)
 
 Because the Controller, backend, prompts and scoring are shared, any measured
@@ -23,16 +23,17 @@ Reproducing the figure for 64 numbers with 4 chunks::
       |
       +-- split (local, no LLM) --> 4 chunks of 16
             |
-            +-- chunk 0 --> Generate(sort, k=3) --> Score --> KeepBest(1) --+
-            +-- chunk 1 --> Generate(sort, k=3) --> Score --> KeepBest(1) --+--> Aggregate(k=10)
-            |                                                               |     --> Score --> KeepBest(1) --+
-            +-- chunk 2 --> Generate(sort, k=3) --> Score --> KeepBest(1) --+                                  |
-            +-- chunk 3 --> Generate(sort, k=3) --> Score --> KeepBest(1) --+--> Aggregate(k=10)               |
-                                                                                  --> Score --> KeepBest(1) --+
-                                                                                                              |
-                                                                          Aggregate(k=10) <-------------------+
-                                                                                  |
-                                                                          Score --> KeepBest(1) --> GroundTruth
+            +-- Generate(sort, k=3)   <- ALL FOUR CHUNKS IN ONE BATCHED CALL
+            +-- Score (local, exact, free)
+            +-- KeepBestPerGroup(chunk_index, n=1)   -> 4 survivors
+            |
+            +-- PairwiseAggregate(k=10)  <- both merges in one batched call
+            +-- Score --> KeepBestPerGroup(_group)   -> 2 survivors
+            |
+            +-- PairwiseAggregate(k=10)
+            +-- Score --> KeepBest(1)                -> 1 answer
+                                |
+                          GroundTruth
 
 Note k=3 for sorting chunks and k=10 for aggregation: these are the paper's
 own values from Figure 4 ("k=3 means that, for each 16 element chunk, we
@@ -40,35 +41,60 @@ generate three different sortings"; "k=10 means that we try 10 different
 aggregations of the two input 16-element subarrays"). Aggregation gets a
 larger k because merging is where errors concentrate -- it is the step that
 must get the global multiset right.
+
+Why the chunk branches are one operation, not four
+---------------------------------------------------
+An earlier version of this file gave each chunk its own
+Selector -> Generate -> Score -> KeepBest chain. The reasoning *graph* was
+identical, but the cost was not: the Controller executes operations one at a
+time, so four single-input Generate operations meant four serial model calls,
+each submitting a batch of one. On a GPU that leaves the device mostly idle.
+
+Folding them into a single ``Generate`` over all four chunk thoughts, followed
+by ``KeepBestPerGroup``, produces exactly the same thoughts and the same edges
+while collapsing 4 serial calls into 1 batched call of 4 prompts (12 sequences
+at k=3). The same argument applies to ``PairwiseAggregate`` at each merge
+level. This matters a great deal on a cluster where GPU time is the budget.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Sequence
 
 from ...operations import (
-    Aggregate,
     Generate,
     GroundTruth,
     Improve,
     InputOp,
     KeepBest,
+    KeepBestPerGroup,
     Operation,
+    PairwiseAggregate,
     Score,
-    Selector,
 )
 from .scoring import is_correctly_sorted, sorting_score
 
 
-def _pick_chunk(index: int):
-    """Selector predicate: keep only the thought whose chunk_index matches.
+# ----------------------------------------------------------------------
+# Token budgeting -- a direct multiplier on GPU cost
+# ----------------------------------------------------------------------
+# Decode time is roughly linear in tokens generated. The answers here are
+# short, fixed-shape lists of single digits, so the required length is
+# predictable and we should say so rather than letting a 1024-token default
+# stand. A list of n digits renders as "[d, d, ..., d]" -- about 3 characters
+# per element, and tokenizers typically split "1," / " 2" into one token each.
+# We budget ~2 tokens per element plus generous slack for the brackets and any
+# short preamble a chatty model might emit.
+def token_budget(n_elements: int) -> int:
+    """Generation cap for an answer listing ``n_elements`` digits."""
+    return max(64, 2 * n_elements + 32)
 
-    Needed because ``split`` emits all chunks from a single operation, but
-    each chunk must then flow down its own independent sorting branch.
-    """
-    def _sel(thoughts):
-        return [t for t in thoughts if t.state.get("chunk_index") == index]
-    return _sel
+
+# Stop strings. The answer is a single line, so anything that starts a new
+# block means the model has finished and moved on to padding or re-explaining.
+# We deliberately do NOT stop on "]" -- the parser needs the closing bracket,
+# and vLLM excludes the stop string from the returned text.
+SORT_STOP: Sequence[str] = ("\n\n", "\nInput", "Example:")
 
 
 # ======================================================================
@@ -91,13 +117,16 @@ def got_sorting_goo(
         How many pieces to decompose into. Must be a power of two for the
         binary merge tree below. The paper uses 4 for 64 elements.
     branching_factor:
-        ``k`` for sorting each chunk (paper: 3).
+        ``k`` for sorting each chunk (paper: 3). Cost scales linearly in k.
     aggregation_attempts:
-        ``k`` for each merge (paper: 10).
+        ``k`` for each merge (paper: 10). This is the **single largest cost
+        knob** in the graph -- every merge level generates this many full-length
+        candidate lists. Halving it roughly halves total decode tokens.
     use_llm_scoring:
         If False (default, and what the paper does for sorting) use the exact
-        local scorer. If True, query the LLM for scores instead -- useful for
-        an ablation showing how much the exact scorer contributes.
+        local scorer -- free, exact, and far cheaper than querying the model.
+        If True, query the LLM for scores instead, which adds one generation
+        per thought; useful only as an ablation.
 
     Returns
     -------
@@ -109,6 +138,8 @@ def got_sorting_goo(
         )
 
     scorer = None if use_llm_scoring else sorting_score
+    n = len(numbers)
+    chunk_size = max(1, -(-n // num_chunks))
 
     # --- Input and structural decomposition --------------------------
     root = InputOp({"current": list(numbers), "original": list(numbers)}, name="Input")
@@ -116,67 +147,66 @@ def got_sorting_goo(
     split = Generate(prompt_name="split", branching_factor=1, name="Split")
     split.add_predecessor(root)
 
-    # --- One independent sorting branch per chunk --------------------
-    # This is the "explore many partial solutions in parallel" part that ToT
-    # also has. The difference from ToT comes later, at the merge.
-    branch_leaves: List[Operation] = []
-    for i in range(num_chunks):
-        pick = Selector(_pick_chunk(i), name=f"PickChunk{i}")
-        pick.add_predecessor(split)
+    # --- Sort every chunk in ONE batched operation -------------------
+    gen = Generate(
+        prompt_name="sort",
+        branching_factor=branching_factor,
+        name=f"SortChunks(k={branching_factor})",
+        max_tokens=token_budget(chunk_size),
+        stop=SORT_STOP,
+    )
+    gen.add_predecessor(split)
 
-        gen = Generate(
-            prompt_name="sort",
-            branching_factor=branching_factor,
-            name=f"SortChunk{i}(k={branching_factor})",
-        )
-        gen.add_predecessor(pick)
+    sc = Score(scoring_fn=scorer, name="ScoreChunks")
+    sc.add_predecessor(gen)
 
-        sc = Score(scoring_fn=scorer, name=f"ScoreChunk{i}")
-        sc.add_predecessor(gen)
-
-        keep = KeepBest(n=1, name=f"KeepBestChunk{i}")
-        keep.add_predecessor(sc)
-
-        branch_leaves.append(keep)
+    # Rank within each chunk so every chunk keeps its own best candidate.
+    level: Operation = KeepBestPerGroup(group_key="chunk_index", n=1,
+                                        name="KeepBestPerChunk")
+    level.add_predecessor(sc)
 
     # --- Binary merge tree of Aggregations ---------------------------
-    # Each level halves the number of partial solutions. This is what gives
-    # latency log_k N while every leaf still reaches the root -- volume N.
-    level = branch_leaves
+    # Each level halves the number of partial solutions and doubles the
+    # length of each. This is what gives latency log_k N while every leaf
+    # still reaches the root -- volume N.
+    remaining = num_chunks
     depth = 0
-    while len(level) > 1:
+    merged_size = chunk_size
+    while remaining > 1:
         depth += 1
-        next_level: List[Operation] = []
-        for j in range(0, len(level), 2):
-            left, right = level[j], level[j + 1]
+        merged_size = min(n, merged_size * 2)
 
-            agg = Aggregate(
-                prompt_name="aggregate",
-                num_merges=aggregation_attempts,
-                name=f"Merge_L{depth}_{j // 2}(k={aggregation_attempts})",
+        agg = PairwiseAggregate(
+            prompt_name="aggregate",
+            num_merges=aggregation_attempts,
+            name=f"Merge_L{depth}(k={aggregation_attempts})",
+            max_tokens=token_budget(merged_size),
+            stop=SORT_STOP,
+        )
+        agg.add_predecessor(level)
+
+        sc_m = Score(scoring_fn=scorer, name=f"ScoreMerge_L{depth}")
+        sc_m.add_predecessor(agg)
+
+        remaining //= 2
+        if remaining > 1:
+            keep: Operation = KeepBestPerGroup(
+                group_key="_group", n=1, name=f"KeepBestMerge_L{depth}"
             )
-            # THE defining GoT edge: two distinct parents into one vertex.
-            agg.add_predecessor(left)
-            agg.add_predecessor(right)
-
-            sc = Score(scoring_fn=scorer, name=f"ScoreMerge_L{depth}_{j // 2}")
-            sc.add_predecessor(agg)
-
-            keep = KeepBest(n=1, name=f"KeepBestMerge_L{depth}_{j // 2}")
-            keep.add_predecessor(sc)
-
-            next_level.append(keep)
-        level = next_level
-
-    final = level[0]
+        else:
+            # Final level: one global winner.
+            keep = KeepBest(n=1, name=f"KeepBestMerge_L{depth}")
+        keep.add_predecessor(sc_m)
+        level = keep
 
     # --- Terminal evaluation -----------------------------------------
     # Compare against the true global input, not the local merge input.
+    target = sorted(numbers)
     gt = GroundTruth(
-        check_fn=lambda st: list(st.get("current", [])) == sorted(numbers),
+        check_fn=lambda st: list(st.get("current", [])) == target,
         name="GroundTruth",
     )
-    gt.add_predecessor(final)
+    gt.add_predecessor(level)
 
     return [gt]
 
@@ -191,7 +221,10 @@ def io_goo(numbers: List[int]) -> List[Operation]:
     """
     root = InputOp({"current": list(numbers), "original": list(numbers)}, name="Input")
 
-    gen = Generate(prompt_name="sort", branching_factor=1, name="Sort(IO)")
+    gen = Generate(
+        prompt_name="sort", branching_factor=1, name="Sort(IO)",
+        max_tokens=token_budget(len(numbers)), stop=SORT_STOP,
+    )
     gen.add_predecessor(root)
 
     sc = Score(scoring_fn=sorting_score, name="Score")
@@ -210,11 +243,14 @@ def cot_goo(numbers: List[int], refine_rounds: int = 1) -> List[Operation]:
     fair: CoT gets more than one LLM call, just no branching.
     """
     root = InputOp({"current": list(numbers), "original": list(numbers)}, name="Input")
+    budget = token_budget(len(numbers))
 
-    gen = Generate(prompt_name="sort", branching_factor=1, name="Sort(CoT)")
+    gen = Generate(prompt_name="sort", branching_factor=1, name="Sort(CoT)",
+                   max_tokens=budget, stop=SORT_STOP)
     gen.add_predecessor(root)
 
-    imp = Improve(prompt_name="improve", rounds=refine_rounds, name="Refine")
+    imp = Improve(prompt_name="improve", rounds=refine_rounds, name="Refine",
+                  max_tokens=budget, stop=SORT_STOP)
     imp.add_predecessor(gen)
 
     sc = Score(scoring_fn=sorting_score, name="Score")
@@ -234,7 +270,8 @@ def cot_sc_goo(numbers: List[int], k: int = 5) -> List[Operation]:
     """
     root = InputOp({"current": list(numbers), "original": list(numbers)}, name="Input")
 
-    gen = Generate(prompt_name="sort", branching_factor=k, name=f"Sort(CoT-SC,k={k})")
+    gen = Generate(prompt_name="sort", branching_factor=k, name=f"Sort(CoT-SC,k={k})",
+                   max_tokens=token_budget(len(numbers)), stop=SORT_STOP)
     gen.add_predecessor(root)
 
     sc = Score(scoring_fn=sorting_score, name="Score")
@@ -256,7 +293,7 @@ def tot_goo(
 ) -> List[Operation]:
     """ToT baseline: iterative branch-score-prune, no aggregation.
 
-    Figure 1(d). At each level we generate ``k`` refinements of the surviving
+    Figure 1(d). At each level we generate refinements of the surviving
     thought(s), score them, and keep the best ``beam_width`` -- i.e. BFS with
     a beam, which is Algorithm 1 of the ToT paper.
 
@@ -265,8 +302,10 @@ def tot_goo(
     what lifts that restriction.
     """
     root = InputOp({"current": list(numbers), "original": list(numbers)}, name="Input")
+    budget = token_budget(len(numbers))
 
-    gen = Generate(prompt_name="sort", branching_factor=branching_factor, name="Sort(ToT)")
+    gen = Generate(prompt_name="sort", branching_factor=branching_factor,
+                   name="Sort(ToT)", max_tokens=budget, stop=SORT_STOP)
     gen.add_predecessor(root)
 
     sc = Score(scoring_fn=sorting_score, name="Score0")
@@ -277,11 +316,10 @@ def tot_goo(
 
     # Each additional level is a refine-and-prune round.
     for level in range(1, depth):
-        imp = Improve(prompt_name="improve", rounds=1, name=f"Refine{level}")
+        imp = Improve(prompt_name="improve", rounds=1, name=f"Refine{level}",
+                      max_tokens=budget, stop=SORT_STOP)
         imp.add_predecessor(current)
 
-        # Refinement produces one thought per input; to branch we score and
-        # prune the accumulated candidates.
         sc_l = Score(scoring_fn=sorting_score, name=f"Score{level}")
         sc_l.add_predecessor(imp)
 
