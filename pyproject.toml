@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "got-replication"
+version = "0.1.0"
+description = "Replication of Graph of Thoughts (Besta et al., AAAI 2024) for open-source LLMs on HPC"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+# Core dependencies only. Heavy, environment-specific backends (vLLM,
+# bitsandbytes, CUDA torch) live in the optional extras below so that a
+# laptop install stays small and an HPC install can pull exactly what it needs.
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "networkx",
+    "tqdm",
+    "pyyaml",
+    "backoff",
+    "rich",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+# Local CPU inference on a quantised GGUF model.
+local = ["llama-cpp-python>=0.3.0"]
+
+# HuggingFace transformers path (works on CPU or GPU).
+hf = ["torch", "transformers>=4.40", "accelerate", "sentencepiece", "protobuf"]
+
+# Full HPC stack: high-throughput GPU serving.
+hpc = ["torch", "transformers>=4.40", "accelerate", "vllm>=0.5.0", "bitsandbytes"]
+
+dev = ["pytest", "pypdf"]
+
+[tool.setuptools.packages.find]
+include = ["got*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
