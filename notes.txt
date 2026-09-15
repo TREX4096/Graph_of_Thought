@@ -1,0 +1,12 @@
+replicate GOT paper the result 
+-Dataset on which is trained
+-Reason all graph
+
+compression COT
+
+table3 : Reasoning data use with GOT instead of COT 
+
+
+we are working on compressing GOT not compressing COT
+
+mbzuai univ

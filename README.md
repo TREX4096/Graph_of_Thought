@@ -10,6 +10,16 @@ locally on a laptop and at scale on HPC GPU nodes.
 For the full conceptual deep-dive across all four papers — every term explained,
 diagrams, and the reasoning behind each design decision — see **[explanation.md](explanation.md)**.
 
+**New to LLMs?** Start with these, in order:
+
+| Section | What it gives you |
+|---|---|
+| [§0 — LLMs in fifteen minutes](explanation.md#0-start-here--llms-in-fifteen-minutes) | tokens, prompts, temperature, batching — no prior knowledge assumed |
+| [§17 — The GoT paper, section by section](explanation.md#17-the-got-paper-read-section-by-section) | a plain-English reading companion for the PDF |
+| [§18 — Datasets](explanation.md#18-datasets--which-ones-and-where-they-come-from) | which data, and why there is nothing to download |
+| [§19 — Models and vLLM](explanation.md#19-models-and-vllm) | what the paper ran, what we run, what vLLM is |
+| [§20 — GPU replication runbook](explanation.md#20-gpu-replication-runbook) | clone → results, for a plain GPU server **or** a SLURM cluster |
+
 ---
 
 ## What this project is about
@@ -127,23 +137,64 @@ method, not a bug in the code.
 
 ---
 
-## Running on HPC
+## Running on a GPU machine
+
+**First, find out which kind of machine you have** — the workflows are different:
 
 ```bash
-# Once, on the cluster:
-bash scripts/slurm/setup_hpc_env.sh
+for c in sbatch srun sinfo; do printf "%-8s %s\n" "$c" "$(command -v $c || echo no)"; done
+nvidia-smi
+```
 
-# Then submit jobs:
+| Result | You have | Use |
+|---|---|---|
+| all `no`, `nvidia-smi` works | a **plain GPU server** | `scripts/run_direct.sh` |
+| `sbatch` resolves | a **SLURM cluster** | `scripts/slurm/run_got.sbatch` |
+
+> `sinfo: command not found` is an answer, not a problem — it means there is no scheduler,
+> so there is nothing to install. **Nothing in this project needs root**: conda, pip, model
+> weights and the benchmark all live under directories you own.
+
+### Plain GPU server (no scheduler)
+
+```bash
+# Once:
+export CONDA_BASE=$(dirname $(dirname $(which conda)))   # wherever your conda lives
+bash scripts/slurm/setup_hpc_env.sh                      # auto-detects; skips `module`
+
+# Check which GPU is free, then run detached (survives SSH disconnect):
+nvidia-smi
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_direct.sh --bg
+
+tail -f logs/got_sorting_64_*.log
+```
+
+Everything is configured by environment variable — no file editing:
+
+```bash
+BACKEND=mock LIMIT=5 bash scripts/run_direct.sh                   # free dry run
+TASK=set_intersection LENGTH=32 bash scripts/run_direct.sh --bg   # paper §5.2
+MODEL_ID=Qwen/Qwen2.5-7B-Instruct AGG_K=5 bash scripts/run_direct.sh --bg
+```
+
+### SLURM cluster
+
+```bash
+bash scripts/slurm/setup_hpc_env.sh
 sbatch scripts/slurm/run_got.sbatch
 
-# With overrides:
 sbatch --export=ALL,MODEL_ID=Qwen/Qwen2.5-7B-Instruct,LENGTH=64,LIMIT=100 \
        scripts/slurm/run_got.sbatch
+sbatch --export=ALL,TASK=set_intersection,LENGTH=32 scripts/slurm/run_got.sbatch
 ```
 
 **Before your first submission**, edit `scripts/slurm/run_got.sbatch` to match your
 cluster — partition name, account code, CUDA module version. Check with `sinfo` and
 `module avail cuda`.
+
+> **Full step-by-step runbook for both paths** — machine discovery, model pre-download, a
+> trial run, and a table of failure modes — is
+> [explanation.md §20](explanation.md#20-gpu-replication-runbook).
 
 Model choice by GPU memory:
 
@@ -239,10 +290,11 @@ in under a second and exercises the whole pipeline.
 │   │   └── local_models.py     LlamaCppLM / HFLM / VLLMLM
 │   └── tasks/
 │       ├── sorting/            §5.1 — fully implemented, 5 schemes
-│       └── set_intersection/   §5.2 — implemented
+│       └── set_intersection/   §5.2 — fully implemented, 5 schemes
 │
 ├── scripts/
 │   ├── generate_data.py        build the datasets
+│   ├── run_direct.sh           run on a plain GPU server (no scheduler, no root)
 │   ├── run_benchmark.py        main experiment runner
 │   ├── visualize_graph.py      draw reasoning graphs + latency/volume plot
 │   ├── download_local_model.sh fetch a small GGUF model
@@ -322,9 +374,10 @@ full honest accounting.
 | Core framework (thoughts, operations, controller, metrics) | ✅ complete, tested |
 | Backends (mock / llama.cpp / HF / vLLM) | ✅ complete |
 | Sorting task, all 5 schemes | ✅ complete |
-| Set intersection task | ✅ complete |
+| Set intersection task, all 5 schemes | ✅ complete |
 | Datasets (all 4 tasks) | ✅ generated |
 | Visualisation | ✅ complete |
+| Plain-GPU-server runner (`run_direct.sh`) | ✅ complete — no scheduler or root needed |
 | HPC / SLURM scripts | ✅ written — **needs cluster-specific edits** |
 | Keyword counting GoO | ⬜ data + mock ready, builder not written |
 | Document merging GoO | ⬜ data ready, needs LLM-based scoring |

@@ -34,10 +34,18 @@ a list can repeat an element even though a set cannot.
 
 from .scoring import intersection_error_scope, intersection_score, is_correct_intersection
 from .prompts import SetIntersectionPrompter, SetIntersectionParser
-from .graphs import got_intersection_goo, io_intersection_goo, SCHEMES
+from .graphs import (
+    cot_intersection_goo,
+    cot_sc_intersection_goo,
+    got_intersection_goo,
+    io_intersection_goo,
+    tot_intersection_goo,
+    SCHEMES,
+)
 
 __all__ = [
     "intersection_error_scope", "intersection_score", "is_correct_intersection",
     "SetIntersectionPrompter", "SetIntersectionParser",
-    "got_intersection_goo", "io_intersection_goo", "SCHEMES",
+    "cot_intersection_goo", "cot_sc_intersection_goo", "got_intersection_goo",
+    "io_intersection_goo", "tot_intersection_goo", "SCHEMES",
 ]

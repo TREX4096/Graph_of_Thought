@@ -36,6 +36,21 @@ Input list 2: {list_b}
 Output:"""
 
 
+# Refinement. Used by the CoT and ToT baselines, which get extra LLM calls
+# but -- unlike GoT -- no way to combine two candidate answers. Keeping the
+# wording parallel to INTERSECT_PROMPT matters: a baseline that loses because
+# its prompt was worse tells us nothing about graph structure.
+IMPROVE_PROMPT = """The list below was supposed to be the intersection of the two input lists, but it contains mistakes.
+It may include numbers that are not in both lists, miss numbers that are, or repeat a number.
+Fix it so that the output contains exactly the numbers appearing in both input lists, each once.
+Output only the corrected list. Do not write any explanation.
+
+Input list 1: {list_a}
+Input list 2: {list_b}
+Incorrect intersection: {current}
+Output:"""
+
+
 class SetIntersectionPrompter(AbstractPrompter):
     """Builds prompts for the intersection pipeline."""
 
@@ -57,6 +72,14 @@ class SetIntersectionPrompter(AbstractPrompter):
                 return None
             return UNION_PROMPT.format(
                 list_a=states[0]["current"], list_b=states[1]["current"]
+            )
+
+        if name == "improve":
+            st = states[0]
+            return IMPROVE_PROMPT.format(
+                list_a=st.get("set_a", []),
+                list_b=st.get("set_b", []),
+                current=st.get("current", []),
             )
 
         raise ValueError(f"SetIntersectionPrompter has no prompt named {name!r}")

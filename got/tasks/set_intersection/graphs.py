@@ -25,6 +25,7 @@ from typing import List
 from ...operations import (
     Generate,
     GroundTruth,
+    Improve,
     InputOp,
     KeepBest,
     KeepBestPerGroup,
@@ -143,7 +144,118 @@ def io_intersection_goo(set_a: List[int], set_b: List[int]) -> List[Operation]:
     return [gt]
 
 
+def cot_intersection_goo(
+    set_a: List[int], set_b: List[int], refine_rounds: int = 1
+) -> List[Operation]:
+    """CoT baseline: one chain, intersect then refine once.
+
+    Mirrors ``sorting.graphs.cot_goo`` exactly -- more than one LLM call, but
+    no branching and no aggregation. Keeping the two tasks' baselines
+    structurally identical is what lets us claim any difference between tasks
+    comes from the task, not from an accidentally stronger baseline.
+    """
+    root = InputOp(
+        {"set_a": list(set_a), "set_b": list(set_b), "current": list(set_b)},
+        name="Input",
+    )
+    budget = token_budget(len(set_a))
+
+    gen = Generate(prompt_name="intersect", branching_factor=1,
+                   name="Intersect(CoT)", max_tokens=budget, stop=STOP)
+    gen.add_predecessor(root)
+
+    imp = Improve(prompt_name="improve", rounds=refine_rounds, name="Refine",
+                  max_tokens=budget, stop=STOP)
+    imp.add_predecessor(gen)
+
+    sc = Score(scoring_fn=intersection_score, name="Score")
+    sc.add_predecessor(imp)
+
+    gt = GroundTruth(check_fn=is_correct_intersection, name="GroundTruth")
+    gt.add_predecessor(sc)
+    return [gt]
+
+
+def cot_sc_intersection_goo(
+    set_a: List[int], set_b: List[int], k: int = 5
+) -> List[Operation]:
+    """CoT-SC baseline: k independent attempts, keep the best-scoring one.
+
+    Selection is by score rather than majority vote. For a 32-element set the
+    answer space is far too large for two samples to ever coincide, so a modal
+    vote would be meaningless -- see explanation.md Sec 3.5.
+    """
+    root = InputOp(
+        {"set_a": list(set_a), "set_b": list(set_b), "current": list(set_b)},
+        name="Input",
+    )
+    gen = Generate(prompt_name="intersect", branching_factor=k,
+                   name=f"Intersect(CoT-SC,k={k})",
+                   max_tokens=token_budget(len(set_a)), stop=STOP)
+    gen.add_predecessor(root)
+
+    sc = Score(scoring_fn=intersection_score, name="Score")
+    sc.add_predecessor(gen)
+
+    keep = KeepBest(n=1, name="KeepBest")
+    keep.add_predecessor(sc)
+
+    gt = GroundTruth(check_fn=is_correct_intersection, name="GroundTruth")
+    gt.add_predecessor(keep)
+    return [gt]
+
+
+def tot_intersection_goo(
+    set_a: List[int],
+    set_b: List[int],
+    branching_factor: int = 3,
+    depth: int = 3,
+    beam_width: int = 1,
+) -> List[Operation]:
+    """ToT baseline: branch, score, prune, refine -- and never merge.
+
+    Every vertex here has exactly one parent, so a good partial answer on a
+    discarded branch is lost permanently. That is the restriction
+    ``got_intersection_goo`` lifts with its union tree.
+    """
+    root = InputOp(
+        {"set_a": list(set_a), "set_b": list(set_b), "current": list(set_b)},
+        name="Input",
+    )
+    budget = token_budget(len(set_a))
+
+    gen = Generate(prompt_name="intersect", branching_factor=branching_factor,
+                   name="Intersect(ToT)", max_tokens=budget, stop=STOP)
+    gen.add_predecessor(root)
+
+    sc = Score(scoring_fn=intersection_score, name="Score0")
+    sc.add_predecessor(gen)
+
+    current: Operation = KeepBest(n=beam_width, name="KeepBest0")
+    current.add_predecessor(sc)
+
+    for level in range(1, depth):
+        imp = Improve(prompt_name="improve", rounds=1, name=f"Refine{level}",
+                      max_tokens=budget, stop=STOP)
+        imp.add_predecessor(current)
+
+        sc_l = Score(scoring_fn=intersection_score, name=f"Score{level}")
+        sc_l.add_predecessor(imp)
+
+        keep_l = KeepBest(n=beam_width, name=f"KeepBest{level}")
+        keep_l.add_predecessor(sc_l)
+
+        current = keep_l
+
+    gt = GroundTruth(check_fn=is_correct_intersection, name="GroundTruth")
+    gt.add_predecessor(current)
+    return [gt]
+
+
 SCHEMES = {
     "io": io_intersection_goo,
+    "cot": cot_intersection_goo,
+    "cot_sc": cot_sc_intersection_goo,
+    "tot": tot_intersection_goo,
     "got": got_intersection_goo,
 }

@@ -10,6 +10,14 @@
 #     sbatch --export=ALL,MODEL_ID=Qwen/Qwen2.5-7B-Instruct,LENGTH=64 \
 #            scripts/slurm/run_got.sbatch
 #
+# The paper's second use case (Section 5.2):
+#     sbatch --export=ALL,TASK=set_intersection,LENGTH=32 \
+#            scripts/slurm/run_got.sbatch
+#
+# A cost/quality sweep -- cheaper as one job than as three, because the model
+# loads once:
+#     sbatch --export=ALL,AGG_K=5 scripts/slurm/run_got.sbatch
+#
 # IMPORTANT -- adapt these before first use. Partition names, module names
 # and account codes are cluster-specific; the values below are common
 # defaults, not universal ones. Run `sinfo` to list partitions and
@@ -31,10 +39,13 @@ set -euo pipefail
 # ---------------------------------------------------------------------
 MODEL_ID="${MODEL_ID:-meta-llama/Llama-3.1-8B-Instruct}"
 BACKEND="${BACKEND:-vllm}"
+TASK="${TASK:-sorting}"          # sorting | set_intersection
 LENGTH="${LENGTH:-64}"
 LIMIT="${LIMIT:-100}"
 SCHEMES="${SCHEMES:-io cot cot_sc tot got}"
 TP_SIZE="${TP_SIZE:-1}"
+AGG_K="${AGG_K:-10}"
+NUM_CHUNKS="${NUM_CHUNKS:-4}"
 OUTDIR="${OUTDIR:-results/hpc_${SLURM_JOB_ID:-manual}}"
 
 mkdir -p logs "$OUTDIR"
@@ -44,8 +55,10 @@ echo "Job ID      : ${SLURM_JOB_ID:-n/a}"
 echo "Node        : $(hostname)"
 echo "Model       : $MODEL_ID"
 echo "Backend     : $BACKEND"
+echo "Task        : $TASK"
 echo "Input length: $LENGTH"
 echo "Schemes     : $SCHEMES"
+echo "Agg k       : $AGG_K   Chunks: $NUM_CHUNKS"
 echo "Started     : $(date)"
 echo "=========================================="
 
@@ -74,26 +87,31 @@ mkdir -p "$HF_HOME"
 # ---------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------
-DATA="data/sorting/sorting_${LENGTH}.csv"
+# Dataset filenames follow "<task>/<task>_<size>.csv" for both tasks.
+DATA="data/${TASK}/${TASK}_${LENGTH}.csv"
 if [ ! -f "$DATA" ]; then
   echo "Dataset missing, generating..."
   python scripts/generate_data.py --out data --seed 42
+fi
+if [ ! -f "$DATA" ]; then
+  echo "ERROR: $DATA still missing after generation -- check TASK/LENGTH." >&2
+  exit 1
 fi
 
 # ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
 srun python scripts/run_benchmark.py \
-    --task sorting \
+    --task "$TASK" \
     --data "$DATA" \
     --limit "$LIMIT" \
     --schemes $SCHEMES \
     --backend "$BACKEND" \
     --model-id "$MODEL_ID" \
     --tensor-parallel-size "$TP_SIZE" \
-    --num-chunks 4 \
+    --num-chunks "$NUM_CHUNKS" \
     --branching-factor 3 \
-    --aggregation-attempts 10 \
+    --aggregation-attempts "$AGG_K" \
     --temperature 1.0 \
     --out "$OUTDIR"
 

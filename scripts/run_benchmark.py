@@ -33,6 +33,14 @@ On the HPC with vLLM::
         --backend vllm --model-id meta-llama/Llama-3.1-8B-Instruct \\
         --out results/hpc
 
+The paper's second use case (Section 5.2), same five schemes::
+
+    python scripts/run_benchmark.py --task set_intersection \\
+        --schemes io cot cot_sc tot got \\
+        --data data/set_intersection/set_intersection_32.csv \\
+        --backend vllm --model-id Qwen/Qwen2.5-7B-Instruct \\
+        --out results/hpc_si
+
 Output
 ------
 Two files per run: a per-instance CSV (easy to load in pandas) and a JSON
@@ -55,6 +63,9 @@ from tqdm import tqdm
 
 from got import Controller, graph_metrics
 from got.backends import get_backend
+from got.tasks.set_intersection import SetIntersectionParser, SetIntersectionPrompter
+from got.tasks.set_intersection.graphs import SCHEMES as INTERSECTION_SCHEMES
+from got.tasks.set_intersection.scoring import intersection_error_scope
 from got.tasks.sorting import SortingParser, SortingPrompter
 from got.tasks.sorting.graphs import SCHEMES as SORTING_SCHEMES
 from got.tasks.sorting.scoring import sorting_error_scope
@@ -63,10 +74,61 @@ from got.tasks.sorting.scoring import sorting_error_scope
 # ----------------------------------------------------------------------
 # Task registry
 # ----------------------------------------------------------------------
-# Each task supplies: how to read a dataset row, how to build a GoO, and how
-# to grade a result. Adding a task means adding one entry here.
+# Each task supplies four things, and nothing else in this file is
+# task-specific:
+#
+#   load_row     CSV row              -> instance dict (must contain "answer")
+#   build        (scheme, instance)   -> the GoO leaves, given CLI structure args
+#   error_scope  (instance, produced) -> the paper's error-scope for this task
+#   max_score    instance             -> denominator for the positive score
+#
+# Adding keyword counting or document merging means adding one entry here plus
+# a tasks/<name>/ package. The Controller, backends and metrics never change.
 def _load_sorting_row(row: Dict[str, str]) -> Dict[str, Any]:
     return {"numbers": json.loads(row["input"]), "answer": json.loads(row["answer"])}
+
+
+def _load_intersection_row(row: Dict[str, str]) -> Dict[str, Any]:
+    return {
+        "set_a": json.loads(row["set_a"]),
+        "set_b": json.loads(row["set_b"]),
+        "answer": json.loads(row["answer"]),
+    }
+
+
+def _build_sorting(scheme: str, builder, inst: Dict[str, Any], args) -> Any:
+    """Apply the CLI's structural hyper-parameters to a sorting scheme.
+
+    Passing them explicitly per scheme -- rather than splatting every argument
+    at every builder -- keeps a branching factor from silently reaching a
+    scheme that has no branches.
+    """
+    numbers = inst["numbers"]
+    if scheme == "got":
+        return builder(numbers, num_chunks=args.num_chunks,
+                       branching_factor=args.branching_factor,
+                       aggregation_attempts=args.aggregation_attempts)
+    if scheme == "tot":
+        return builder(numbers, branching_factor=args.branching_factor,
+                       depth=args.tot_depth)
+    if scheme == "cot_sc":
+        return builder(numbers, k=args.branching_factor)
+    return builder(numbers)
+
+
+def _build_intersection(scheme: str, builder, inst: Dict[str, Any], args) -> Any:
+    """Same dispatch for set intersection, which takes two input sets."""
+    a, b = inst["set_a"], inst["set_b"]
+    if scheme == "got":
+        return builder(a, b, num_chunks=args.num_chunks,
+                       branching_factor=args.branching_factor,
+                       aggregation_attempts=args.aggregation_attempts)
+    if scheme == "tot":
+        return builder(a, b, branching_factor=args.branching_factor,
+                       depth=args.tot_depth)
+    if scheme == "cot_sc":
+        return builder(a, b, k=args.branching_factor)
+    return builder(a, b)
 
 
 TASKS = {
@@ -75,6 +137,22 @@ TASKS = {
         "prompter": SortingPrompter,
         "parser": SortingParser,
         "load_row": _load_sorting_row,
+        "build": _build_sorting,
+        "error_scope": lambda inst, out: sorting_error_scope(inst["numbers"], out),
+        "max_score": lambda inst: len(inst["numbers"]),
+    },
+    "set_intersection": {
+        "schemes": INTERSECTION_SCHEMES,
+        "prompter": SetIntersectionPrompter,
+        "parser": SetIntersectionParser,
+        "load_row": _load_intersection_row,
+        "build": _build_intersection,
+        # The paper scales the intersection score by |A| (Sec 5.2), so the
+        # denominator is the input set size, not the size of the answer.
+        "error_scope": lambda inst, out: intersection_error_scope(
+            inst["set_a"], inst["set_b"], out
+        ),
+        "max_score": lambda inst: len(inst["set_a"]),
     },
 }
 
@@ -100,6 +178,13 @@ def build_backend(args) -> Any:
         if args.backend == "vllm":
             kwargs["tensor_parallel_size"] = args.tensor_parallel_size
             kwargs["max_model_len"] = args.n_ctx
+            # Fraction of TOTAL card memory vLLM will claim for itself. On a
+            # shared GPU this must be lowered: vLLM sizes its KV cache against
+            # the whole card, not the free space, so the 0.90 default will try
+            # to take 44 GB of a 48 GB card that already has someone else's
+            # 13 GB on it -- crashing this run and squeezing theirs.
+            kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
+            kwargs["max_num_seqs"] = args.max_num_seqs
         else:
             kwargs["load_in_4bit"] = args.load_in_4bit
         return get_backend(args.backend, **kwargs)
@@ -110,26 +195,8 @@ def run_one(
     scheme: str, task_cfg: Dict[str, Any], instance: Dict[str, Any], lm, args
 ) -> Dict[str, Any]:
     """Execute a single (scheme, instance) pair and collect its metrics."""
-    numbers = instance["numbers"]
     builder = task_cfg["schemes"][scheme]
-
-    # GoT and ToT take structural hyper-parameters; the simpler baselines
-    # take none. Keeping this explicit avoids silently passing a branching
-    # factor to a scheme that has no branches.
-    if scheme == "got":
-        leaves = builder(
-            numbers,
-            num_chunks=args.num_chunks,
-            branching_factor=args.branching_factor,
-            aggregation_attempts=args.aggregation_attempts,
-        )
-    elif scheme == "tot":
-        leaves = builder(numbers, branching_factor=args.branching_factor,
-                         depth=args.tot_depth)
-    elif scheme == "cot_sc":
-        leaves = builder(numbers, k=args.branching_factor)
-    else:
-        leaves = builder(numbers)
+    leaves = task_cfg["build"](scheme, builder, instance, args)
 
     # Reset per instance so token cost is attributable to this instance alone.
     lm.reset_usage()
@@ -155,10 +222,13 @@ def run_one(
         "scheme": scheme,
         "failed": failed,
         "error": error_msg,
-        "correct": bool(produced == instance["answer"]),
-        "error_scope": sorting_error_scope(numbers, produced),
+        # Set intersection is order-insensitive, so equality is checked on the
+        # task's own terms via error_scope == 0 as well as literal equality.
+        "correct": bool(produced == instance["answer"])
+        or task_cfg["error_scope"](instance, produced) == 0,
+        "error_scope": task_cfg["error_scope"](instance, produced),
         "score": best.score if best else 0.0,
-        "max_score": len(numbers),
+        "max_score": task_cfg["max_score"](instance),
         "n_llm_calls": lm.usage.n_calls,
         # Batches are GPU round trips and therefore what maps to cluster cost;
         # n_llm_calls is prompts served. Their ratio is the mean batch size.
@@ -193,6 +263,15 @@ def main() -> None:
     ap.add_argument("--model-id", help="HF model id (hf / vllm)")
     ap.add_argument("--tensor-parallel-size", type=int, default=1)
     ap.add_argument("--load-in-4bit", action="store_true")
+    # Shared-GPU safety. vLLM measures this against the card's TOTAL memory,
+    # so on a card others are already using you must budget for them:
+    #     util ~= (free_MiB - 4000) / total_MiB
+    # e.g. 36 GB free of 48 GB -> about 0.60. Default 0.85 suits an idle card.
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.85,
+                    help="vLLM: fraction of TOTAL GPU memory to claim. "
+                         "LOWER THIS on a shared GPU (see --help notes)")
+    ap.add_argument("--max-num-seqs", type=int, default=256,
+                    help="vLLM: concurrent sequence cap; lower it if OOM mid-run")
     ap.add_argument("--n-ctx", type=int, default=4096)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--max-tokens", type=int, default=1024)

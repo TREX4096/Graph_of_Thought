@@ -17,6 +17,9 @@ Chain-of-Thought  →  Tree of Thoughts  →  Graph of Thoughts
 
 **Contents**
 
+**New to LLMs? Start with section 0.**
+
+0. [Start here — LLMs in fifteen minutes](#0-start-here--llms-in-fifteen-minutes)
 1. [Notation](#1-notation)
 2. [The autoregressive bottleneck — stated formally](#2-the-autoregressive-bottleneck--stated-formally)
 3. [Paper 1 — Chain-of-Thought](#3-paper-1--chain-of-thought)
@@ -33,6 +36,214 @@ Chain-of-Thought  →  Tree of Thoughts  →  Graph of Thoughts
 14. [Implementation decisions](#14-implementation-decisions)
 15. [Bugs found, and what they taught me](#15-bugs-found-and-what-they-taught-me)
 16. [What I verified, and what I did not](#16-what-i-verified-and-what-i-did-not)
+17. [The GoT paper, read section by section](#17-the-got-paper-read-section-by-section)
+18. [Datasets — which ones, and where they come from](#18-datasets--which-ones-and-where-they-come-from)
+19. [Models and vLLM](#19-models-and-vllm)
+20. [GPU replication runbook](#20-gpu-replication-runbook) — plain server **or** SLURM cluster
+
+---
+
+## 0. Start here — LLMs in fifteen minutes
+
+*This section assumes no background at all. If you already know what a token, a prompt
+and a temperature are, skip to [§1](#1-notation).*
+
+### 0.1 What a language model actually does
+
+Strip away the marketing and a large language model (LLM) does exactly one thing:
+
+> **Given a piece of text, predict the next word.**
+
+That is the whole job. You give it `"The capital of France is"` and it produces a
+probability distribution over everything that could come next — `" Paris"` at 0.92,
+`" a"` at 0.01, `" located"` at 0.005, and so on for every word it knows. It picks one,
+sticks it on the end, and then predicts the next word from the new, longer text. It
+repeats until it decides to stop.
+
+```
+"The capital of France is"           ->  " Paris"
+"The capital of France is Paris"     ->  "."
+"The capital of France is Paris."    ->  <stop>
+```
+
+This is called **autoregressive** generation — "auto" (self) + "regressive" (feeding
+back into itself). Everything in all four of your papers follows from this one
+mechanism, so it is worth being comfortable with it.
+
+### 0.2 Tokens, not words
+
+The model does not work in words. It works in **tokens** — chunks of text that are
+roughly 3–4 characters. Common words are one token; rare words are split up.
+
+```
+"unbelievable"   ->  ["un", "bel", "iev", "able"]                        4 tokens
+"the"            ->  ["the"]                                             1 token
+"[3, 7, 0, 2]"   ->  ["[", "3", ",", " 7", ",", " 0", ",", " 2", "]"]    9 tokens
+```
+
+Why you care: **tokens are the unit of both cost and time.** A cloud API bills per
+token. On a GPU, every single token requires one full pass through the network. So
+"how many tokens did this scheme use" *is* the cost question, and it is the column our
+benchmark prints as `tokens`.
+
+Rule of thumb: 1 token ≈ 0.75 English words. A 64-number list is roughly 130 tokens.
+
+### 0.3 The prompt and the context window
+
+The **prompt** is the text you feed in. The **context window** is the maximum amount of
+text the model can hold at once — prompt plus generated output together. GPT-3.5 in the
+GoT paper used 4,000 tokens; Llama-3.1 allows 128,000.
+
+This is a hard wall. If your prompt plus the answer exceeds it, the model either errors
+or silently forgets the beginning. It is one reason decomposition helps: four small
+prompts always fit, one huge prompt may not.
+
+### 0.4 Training versus inference — and why we only do the second
+
+| | Training | Inference |
+|---|---|---|
+| What happens | The model's weights $\theta$ are changed | Weights are frozen; text goes in, text comes out |
+| Cost | Millions of dollars, thousands of GPUs | Fractions of a second on one GPU |
+| Who does it | Meta, OpenAI, Alibaba | You |
+
+**Nothing in this entire project trains anything.** CoT, ToT and GoT are all
+*prompting* methods — they change the text you send in and how you organise the replies.
+The weights never move. This is the single most important thing to understand about why
+these papers matter: they buy large capability gains for zero training cost.
+
+When the papers say "without resorting to any model updates", this is what they mean.
+
+### 0.5 Temperature, and why you get different answers each time
+
+The model outputs probabilities. How you turn probabilities into an actual choice is
+**sampling**, and **temperature** $T$ controls it:
+
+- $T = 0$ — always take the highest-probability token. Deterministic. Same input, same
+  output, every time. (Also called *greedy decoding*.)
+- $T = 1$ — sample proportionally to the probabilities. Random. Same input, different
+  output each run.
+- $T > 1$ — flatten the distribution further. More random, usually worse.
+
+The GoT paper sets $T = 1.0$, and so do we. **This is not a detail — it is what makes
+the whole approach possible.** If temperature were 0, asking the model to sort the same
+chunk three times would give three identical answers and there would be nothing to
+choose between. Branching, best-of-$k$, self-consistency, aggregation over different
+candidates — all of it needs the model to be able to give you genuinely different
+attempts at the same question.
+
+> **Say this in your viva:** temperature 1.0 is what converts one model into a
+> *population* of noisy solvers, and every scheme past IO is a strategy for combining a
+> population of noisy solvers.
+
+### 0.6 Few-shot prompting (in-context learning)
+
+You can show the model examples inside the prompt, and it will imitate their pattern:
+
+```
+Sort the following list of numbers in ascending order.
+
+Example:
+Input:  [3, 7, 0, 2, 8, 1]
+Output: [0, 1, 2, 3, 7, 8]
+
+Input:  [5, 5, 1, 9, 2, 2]
+Output:
+```
+
+That is **1-shot** prompting (one example). Zero examples is **zero-shot**; several is
+**few-shot**. The technical name is **in-context learning (ICL)** — the model "learns"
+the task from the prompt itself, without any weight update.
+
+This is exactly what [`prompts.py`](got/tasks/sorting/prompts.py#L36-L44) does, and the
+CoT paper is the one that established you need it.
+
+Note the cost consequence, which the GoT paper raises in §7.3: the example is sent on
+**every single call**. If you split a task into 8 chunks, you pay for that example 8
+times. This is the "static prompt overhead" that eats into the savings from
+decomposition.
+
+### 0.7 What a "thought" is
+
+In these papers a **thought** is just *one LLM output representing a partial or complete
+solution*. The papers deliberately refuse to define it more tightly, because it is
+task-dependent:
+
+| Task | One thought is... |
+|---|---|
+| Sorting | a list of numbers |
+| Set intersection | a set of numbers |
+| Keyword counting | a dictionary `{"India": 3, "Peru": 1}` |
+| Creative writing | a paragraph |
+| Code debugging | a block of code |
+
+In our code a thought is a [`Thought`](got/thought.py) object: a `state` dictionary, a
+`score`, a `valid` flag, and pointers to its parents.
+
+### 0.8 An "LLM call", and why we count three different things
+
+One **call** = one prompt sent in, one completion out. Our benchmark tracks three
+separate numbers, and they mean genuinely different things:
+
+| Column | Meaning | Why it matters |
+|---|---|---|
+| `calls` | prompts served | the paper's notion of "number of thoughts" |
+| `batch` | GPU round trips | what actually determines wall-clock time |
+| `tokens` | tokens in + out | what determines money / GPU-hours |
+
+`calls` and `batch` differ because a GPU can process many prompts simultaneously — see
+[§0.10](#010-batching--the-single-biggest-speed-lever).
+
+### 0.9 Why LLMs are bad at sorting — the motivating failure
+
+This is the specific failure the GoT paper builds on, quoted from its §5.1:
+
+> "The considered LLMs are unable to sort a sequence of such numbers correctly beyond a
+> certain length consistently **because duplicate counts do not match**."
+
+Think about what sorting `[4, 2, 7, 2, 9, 2, 1]` requires. The model must emit `2`
+exactly three times — not two, not four. But it has no counter, no scratch variable. It
+has only the text written so far and a fuzzy internal sense of "have I done enough 2s
+yet?". At length 8 it manages. At length 64 it loses track and drops one.
+
+This is why the task is a good benchmark: **the failure is not about intelligence, it is
+about working memory**, and decomposition attacks it directly. Sorting a 16-element chunk
+is inside the model's reliable range. Merging two sorted 16-element lists is also inside
+its reliable range. So do only those two things, many times.
+
+### 0.10 Batching — the single biggest speed lever
+
+A GPU is a machine for doing thousands of identical operations at once. Send it one
+prompt and most of the chip idles. Send it forty prompts together and it processes them
+in roughly the time of one.
+
+```
+40 separate calls:   [p1] [p2] [p3] ... [p40]     ~40 x latency
+1 batched call:      [p1 p2 p3 ... p40]           ~1  x latency
+```
+
+This is why [`graphs.py`](got/tasks/sorting/graphs.py#L48-L59) folds all four chunk-sorts
+into a *single* `Generate` operation rather than four. The reasoning graph is identical;
+the GPU bill is four times smaller. It is also the main thing vLLM
+([§19](#19-models-and-vllm)) is good at.
+
+### 0.11 The vocabulary you now have
+
+| Term | One-line meaning |
+|---|---|
+| Token | ~4 characters; the unit of cost and compute |
+| Prompt | the text you send in |
+| Context window | max tokens the model can hold at once |
+| Inference | running the model (what we do) |
+| Training | changing the model's weights (what we never do) |
+| Temperature | randomness knob; we use 1.0 |
+| Greedy decoding | temperature 0; always pick the likeliest token |
+| Few-shot / ICL | teaching by examples inside the prompt |
+| Thought | one LLM output representing a partial solution |
+| Call | one prompt in, one completion out |
+| Batch | many prompts sent to the GPU together |
+| Weights / $\theta$ | the numbers inside the model; frozen throughout this project |
+
+With that, the rest of this document is readable.
 
 ---
 
@@ -374,6 +585,11 @@ Hence in our implementation a `KeepBest` sits between every `Generate` and the
 ## 6. Paper 4 — Graph of Thoughts
 
 > Besta et al., AAAI 2024. [arXiv:2308.09687](https://arxiv.org/abs/2308.09687)
+
+> **This section develops the mathematics.** For a plain-English walkthrough of the paper
+> in its own order — every section, with the key lines quoted and translated — see
+> [§17](#17-the-got-paper-read-section-by-section). If you are reading the PDF for the
+> first time, start there and come back here.
 
 ### 6.1 Formal definition
 
@@ -1268,6 +1484,1344 @@ cluster with open-source models.
 
 **Remaining:** running it against a real open-weights model at scale. Everything needed is
 in place.
+
+---
+
+## 17. The GoT paper, read section by section
+
+[§6](#6-paper-4--graph-of-thoughts) develops the mathematics. This section is the
+*reading companion*: it walks the paper front to back in its own order, quotes the lines
+that carry the argument, translates each into plain English, and says where it lives in
+our code. Read it with the PDF open beside you.
+
+> Besta, M., Blach, N., Kubíček, A., et al. **Graph of Thoughts: Solving Elaborate
+> Problems with Large Language Models.** AAAI 2024.
+> [arXiv:2308.09687](https://arxiv.org/abs/2308.09687)
+
+**Map of the paper**
+
+| § | Title | What it is doing | Pages |
+|---|---|---|---|
+| 1 | Introduction | The pitch and the four contributions | 1–2 |
+| 2 | Background & Notation | Defines IO, CoT, CoT-SC, ToT so it can beat them | 2 |
+| 3 | The GoT Framework | ★ The actual contribution: graph + transformations | 2–4 |
+| 4 | System Architecture | How you build it: Prompter/Parser/Scorer/Controller | 4–5 |
+| 5 | Example Use Cases | Sorting, set intersection, keyword counting, doc merging | 6–7 |
+| 6 | Latency–Volume Tradeoff | ★ The theory result: the Table 2 claim | 7 |
+| 7 | Evaluation | The experiments and numbers | 7–9 |
+| 8 | Related Work | Positioning | 9–10 |
+| 9 | Conclusion | Summary | 10 |
+
+**If you have limited time, read §3.2, §4.5, §5.1 and §6.** Those four subsections
+contain everything that is genuinely new.
+
+---
+
+### 17.1 Abstract — the claim in four sentences
+
+> "We introduce Graph of Thoughts (GoT): a framework that advances prompting capabilities
+> in large language models (LLMs) beyond those offered by paradigms such as
+> Chain-of-Thought or Tree of Thoughts (ToT). **The key idea and primary advantage of GoT
+> is the ability to model the information generated by an LLM as an arbitrary graph**,
+> where units of information ("LLM thoughts") are vertices, and edges correspond to
+> dependencies between these vertices."
+
+Three things are being asserted, and it is worth separating them because they are
+independently checkable:
+
+1. **Representational.** Reasoning can be modelled as an arbitrary graph. (Definitional —
+   true by construction.)
+2. **Empirical.** Doing so improves quality: *"increases the quality of sorting by 62%
+   over ToT, while simultaneously reducing costs by >31%"*. (Needs experiments.)
+3. **Theoretical.** GoT has a better latency–volume tradeoff than every predecessor.
+   (Proved in §6.)
+
+Your replication can establish (1) and (3) with the mock backend alone — they are
+structural. Claim (2) is the one that requires a real model, which is exactly why the
+HPC run matters. See [§16](#16-what-i-verified-and-what-i-did-not).
+
+---
+
+### 17.2 §1 Introduction — why a graph
+
+The introduction sets up a ladder, each rung fixing a flaw in the one below. Its core
+sentence:
+
+> "ToT approaches still fundamentally limit the reasoning abilities within a prompt by
+> **imposing the rigid tree structure** on the thought process."
+
+Then the human-reasoning analogy, which is the intuition to remember:
+
+> "When working on a novel idea, a human would not only follow a chain of thoughts (as in
+> CoT) or try different separate ones (as in ToT), but would actually form a more complex
+> network of thoughts. For example, one could explore a certain chain of reasoning,
+> backtrack and start a new one, then realize that **a certain idea from the previous
+> chain could be combined with the currently explored one, and merge them both into a new
+> solution**, taking advantage of their strengths and eliminating their weaknesses."
+
+*Plain English:* a tree can only ever split. It can never bring two branches back
+together. But combining two half-good ideas into one better idea is a thing people do
+constantly, and no tree can express it.
+
+The paper then gives two more motivations beyond human reasoning — worth a sentence in
+your report because they show the idea is not arbitrary:
+
+- **Brains** form recurrent networks, not trees.
+- **Algorithms** are naturally DAGs. Merge sort *is* a diamond: split, split, merge,
+  merge. A tree cannot represent merge sort.
+
+**The four stated contributions:**
+
+| # | Contribution | Where |
+|---|---|---|
+| 1 | GoT as networked reasoning with aggregation | §3 |
+| 2 | Modular, extensible architecture | §4 |
+| 3 | Use cases and evaluation showing gains over ToT | §5, §7 |
+| 4 | The latency–volume metric and tradeoff analysis | §6 |
+
+Note that contribution #4 is a *metric*, not an algorithm. The authors invented a way of
+measuring prompting schemes that happens to show their scheme winning. That is a legitimate
+contribution, but be ready if an examiner pushes on it — the honest answer is that volume
+measures *potential* information flow, not whether the information was used well.
+
+---
+
+### 17.3 §2 Background & Notation — the four baselines
+
+This section exists to define the competition precisely. One line matters more than the
+rest:
+
+> "We purposefully **do not prescribe what is a single 'thought'**, and instead make it
+> use-case specific. Hence, a single thought can be a paragraph (e.g., in article
+> summary), a document (e.g., in document generation), a block of code (e.g., in code
+> debugging or optimization), and so on."
+
+*Plain English:* "thought" is a role, not a type. Whatever your task's unit of partial
+progress is, that is a thought. In our sorting implementation it is a list of integers,
+carried in `state["current"]`.
+
+The four baselines, in one table each with its fatal flaw:
+
+| Scheme | Structure | Fatal flaw the next one fixes |
+|---|---|---|
+| **IO** | $x \to y$ | no intermediate work at all |
+| **CoT** | $x \to z_1 \to \cdots \to y$ | one path only; a wrong step is unrecoverable |
+| **CoT-SC** | $k$ independent chains, pick best | *"it does not offer 'local exploration' within a path, such as backtracking"* |
+| **ToT** | a tree, with a generator + state evaluator + search (BFS/DFS) | cannot merge two branches |
+
+That CoT-SC quote is the paper's own words, and it is the justification for ToT. The ToT
+description introduces three components you should know by name, because GoT keeps two of
+them:
+
+- **thought generator** — produces $k$ children from a node → our `Generate`
+- **state evaluator** — scores nodes → our `Score`
+- **search algorithm** (BFS/DFS) — decides traversal order → in GoT this is replaced by
+  the explicit **GoO**, which is the more important change than it looks
+
+**Why that last swap matters:** ToT *searches* a space. GoT *executes a plan*. ToT asks
+"which node should I expand next?" and answers it at runtime; GoT says "here is the exact
+DAG of operations, run it in topological order." GoT is less adaptive and far more
+predictable — and predictability is what lets you price a job before submitting it
+([§11.3](#113-pricing-a-job-before-submitting-it)).
+
+---
+
+### 17.4 §3.1 Reasoning Process — the formal object
+
+> "We model the reasoning process as a directed graph $G = (V, E)$; $V$ is a set of
+> vertices and $E \subseteq V \times V$ is a set of edges. **A vertex contains a solution
+> to a problem at hand** (be it an initial, intermediate, or a final one). ... **A directed
+> edge $(t_1, t_2)$ indicates that thought $t_2$ has been constructed using $t_1$ as
+> "direct input"**, i.e., by explicitly instructing the LLM to use $t_1$ for generating
+> $t_2$."
+
+Read the edge definition twice. It is stricter than you might assume: an edge is not
+"these are related" or "this came after that". It means **the text of $t_1$ was literally
+placed inside the prompt that produced $t_2$.** Edges are data dependencies.
+
+That strictness is what makes volume in §6 meaningful: a path from $u$ to $t$ means
+information from $u$ could genuinely have reached $t$.
+
+The section also introduces **heterogeneous graphs**:
+
+> "In certain use cases, graph nodes belong to different classes. For example, in writing
+> tasks, some vertices model plans of writing a paragraph, while other vertices model the
+> actual paragraphs of text. In such cases, GoT embraces a heterogeneous graph
+> $G = (V, E, c)$ ... where $c$ maps vertices $V$ into their respective classes $C$."
+
+*Plain English:* different kinds of thought can coexist in one graph. We do not need this
+for sorting (every thought is a list), which is why our
+[`Thought`](got/thought.py) class has no `class` field. Mention it in your report as
+"supported by the framework, unused by our tasks" — it is a fair scoping decision.
+
+---
+
+### 17.5 §3.2 Transformations of Thoughts ★ — the heart of the paper
+
+If you read one subsection, read this one. A transformation is written as what it adds
+and removes:
+
+$$\mathcal{T}(G, p_\theta) = (V^+, V^-, E^+, E^-)$$
+
+$$G' = \bigl((V \cup V^+) \setminus V^-,\; (E \cup E^+) \setminus E^-\bigr)$$
+
+*Plain English:* "here are the new vertices, the deleted vertices, the new edges, the
+deleted edges; apply them to get the new graph." It is a graph rewrite rule. Nothing
+deeper.
+
+**Three transformations:**
+
+**(a) Aggregation** — $k$ thoughts in, 1 thought out. ★
+
+$$V^+ = \{v^+\}, \qquad E^+ = \{(v_1, v^+), (v_2, v^+), \ldots, (v_k, v^+)\}$$
+
+```
+    v₁    v₂    v₃    v₄
+      \    \    /    /
+           \  /
+            v⁺          in-degree = 4
+```
+
+This is **the entire contribution of the paper.** Everything else — the architecture, the
+use cases, the metric — exists to support or measure this one operation.
+
+Why it is genuinely new, stated as a two-line proof:
+
+- A tree requires every vertex to have in-degree $\le 1$.
+- Aggregation produces a vertex of in-degree $k > 1$.
+- ∴ **any graph containing an aggregation is not a tree.** ∎
+
+This is not a matter of taste or convenience. The moment you want to merge, the tree
+abstraction is mathematically inadequate. That sentence is the one to put in your
+presentation.
+
+In our code: [`PairwiseAggregate`](got/operations.py) with `num_merges=k`.
+
+**(b) Generation** — 1 thought in, $k$ thoughts out.
+
+$$V^+ = \{v_1^+, \ldots, v_k^+\}, \qquad E^+ = \{(v, v_1^+), \ldots, (v, v_k^+)\}$$
+
+Nothing new — this is exactly ToT branching and CoT-SC sampling. GoT includes it so it
+can express those schemes as special cases. In our code: `Generate(branching_factor=k)`.
+
+**(c) Refinement** — improve a thought in place, drawn as a self-loop.
+
+$$V^+ = \varnothing, \qquad E^+ = \{(v, v)\}$$
+
+Also impossible in a tree, since trees are acyclic. In our code we implement this as
+[`Improve`](got/operations.py), which creates a *new* vertex rather than a literal
+self-loop — see [§14.4](#144-refinement-as-a-fresh-vertex-not-a-literal-self-loop) for
+why (short version: a literal self-loop makes the graph cyclic and destroys topological
+ordering, and you lose the audit trail of what the thought used to be).
+
+**The generalisation claim.** Because GoT has generation, and trees are generation-only,
+GoT subsumes ToT; because ToT subsumes CoT-SC and CoT-SC subsumes CoT:
+
+$$\text{CoT} \subset \text{CoT-SC} \subset \text{ToT} \subset \text{GoT}$$
+
+This is why our repo builds all five schemes on one engine
+([`graphs.py`](got/tasks/sorting/graphs.py)) — the containment is not just rhetorical,
+it is implementable. Any measured difference between our five schemes is therefore
+attributable to graph structure alone, which is the experimental design the replication
+needs.
+
+---
+
+### 17.6 §3.3 Scoring & Ranking — how you choose
+
+> "$\mathcal{E}(v, G, p_\theta)$ ... we use $\mathcal{E}$ to score thoughts ... Note that
+> $\mathcal{E}$ **may take the whole graph** $G$ as input, because scores may be relative
+> to other thoughts."
+
+> "$\mathcal{R}(G, p_\theta, h)$ ... returns the $h$ highest scoring thoughts."
+
+Two things to notice.
+
+**First, the whole-graph argument.** $\mathcal{E}$ receives $G$, not just $v$. This
+permits relative scoring ("is this better than its siblings?"). We do not exploit it —
+our scorers are pure functions of the thought — but the signature in
+[`operations.py`](got/operations.py) keeps the door open.
+
+**Second, and much more important for cost:**
+
+> "use cases such as sorting use **simple local scoring functions**."
+
+*Plain English:* for sorting you do not need to ask the model how good an answer is. You
+can compute it in Python, exactly, for free. Count inversions, compare digit frequencies,
+done.
+
+This is a large and underappreciated advantage over ToT. ToT's state evaluator is usually
+*another LLM call*, which means it costs tokens and — worse — it is noisy. A scorer that
+is wrong sometimes will occasionally discard the correct answer and keep a wrong one. Our
+sorting scorer is exact and zero-variance, so best-of-$k$ selection behaves the way the
+theory in [§8.1](#81-with-a-perfect-scorer) predicts rather than the way
+[§8.2](#82-with-an-imperfect-scorer) predicts.
+
+Document merging (§5.4) is the counter-example where LLM scoring is unavoidable, because
+"how redundant is this NDA" has no Python implementation.
+
+---
+
+### 17.7 §4 System Architecture — the part you actually implement
+
+Four modules plus a controller. This maps one-to-one onto our package layout, which is
+not a coincidence — it is how the replication was structured.
+
+> "These modules are the **Prompter** (prepares the messages for the LLM), the **Parser**
+> (extracts information from LLM thoughts), the **Scoring module** (verifies and scores
+> the LLM thoughts), and the **Controller** (coordinates the entire reasoning process)."
+
+| Paper § | Module | Its job | Our file |
+|---|---|---|---|
+| 4.1 | Prompter | build the prompt text for a step | [`prompter.py`](got/prompter.py) → `tasks/*/prompts.py` |
+| 4.2 | Parser | turn raw model text into a thought state | same files, `AbstractParser` |
+| 4.3 | Scoring & Validation | is it valid, and how good is it | `tasks/*/scoring.py` |
+| 4.4 | Controller | run the plan | [`controller.py`](got/controller.py) |
+| 4.5 | GoO / GRS | the plan, and the state | `operations.py` / `thought.py` |
+
+**§4.5 is the subsection that decides your implementation's whole shape.** Read it
+carefully:
+
+> "**GoO is a static structure** that specifies the graph decomposition of a given task,
+> i.e., it prescribes transformations to be applied to LLM thoughts, together with their
+> order & dependencies. **GRS is a dynamic structure** that maintains the state of the
+> ongoing LLM reasoning process (the history of its thoughts and their states)."
+
+This is the distinction beginners most often miss, so here it is concretely:
+
+```
+GoO — Graph of OPERATIONS         GRS — Graph Reasoning STATE
+built once, before you run        grown while you run
+"split, then sort, then merge"    "here are the 39 actual lists produced"
+a recipe                          a meal
+1 per task configuration          1 per input instance
+```
+
+Run one GoO over 100 sorting instances and you get **one GoO and 100 different GRSs.**
+
+In our code the GoO is the list of `Operation` objects returned by
+[`got_sorting_goo()`](got/tasks/sorting/graphs.py#L103); the GRS is the set of `Thought`
+objects the `Controller` accumulates as it executes them in topological order.
+
+---
+
+### 17.8 §5.1 Sorting ★ — the use case we replicate
+
+> "We consider sorting numbers 0–9 with duplicates. The considered LLMs are unable to sort
+> a sequence of such numbers correctly beyond a certain length consistently **because
+> duplicate counts do not match**."
+
+> "In GoT, we employ **merge-based sorting**: First, one decomposes the input sequence of
+> numbers into subarrays. Then, one sorts these subarrays individually, and then
+> respectively merges them into a final solution."
+
+*Plain English:* it is merge sort, with the LLM playing the role of both the "sort a small
+array" primitive and the "merge two sorted arrays" primitive. That is the whole design.
+
+**The score function**, which the paper calls *error-scope*:
+
+$$\text{error-scope} = X + Y$$
+
+$$X = \sum_{i=1}^{m-1} \operatorname{sgn}\bigl(\max(b_i - b_{i+1},\, 0)\bigr)
+\qquad
+Y = \sum_{i=0}^{9} \Bigl|\,|\{b_p : b_p = i\}| - |\{a_q : a_q = i\}|\,\Bigr|$$
+
+Decoded:
+
+- $X$ counts **inversions** — adjacent pairs in the wrong order. For each $i$, if
+  $b_i > b_{i+1}$ the `sgn(max(...))` evaluates to 1, else 0. So $X$ = "how many places is
+  this list not ascending".
+- $Y$ counts **multiset violations** — for each digit 0–9, how far off the count is. If the
+  input had three 2s and the output has two, that contributes 1.
+
+$X = Y = 0$ ⟺ the output is a correct sorting of the input. Both terms are needed: $X$
+alone would give a perfect score to `[5]`, and $Y$ alone would give a perfect score to the
+unsorted input.
+
+The paper adds two presentational steps:
+
+> "we additionally apply clipping $\min(\text{error-scope}, n)$, as some baselines (IO,
+> CoT) result in large numbers of outliers with high error scope. Finally, to use a
+> 'positive score' ... one can use the value $\max(n - \text{error-scope}, 0)$."
+
+The clipping exists purely so that one catastrophic IO run does not blow up the y-axis of
+Figure 5. Keep it, so your plots are comparable to theirs.
+
+**Figure 4 is the single most useful picture in the paper.** It is the concrete GoO for
+64 numbers, and the annotations give you the hyper-parameters directly:
+
+> "**k=3** means that, for each 16 element chunk, we generate three different sortings.
+> Here, **N=1** means that we maintain a single best sorting outcome out of the three input
+> ones. Here, **k=10** means that we try 10 different aggregations of the two input
+> 16-element subarrays."
+
+So: branching factor 3 for chunk sorting, keep-best 1, and **aggregation attempts 10**.
+Note the asymmetry — merging gets more than three times the budget of sorting. That is
+deliberate: merging is where errors concentrate, because it is the only step that has to
+get the *global* multiset right.
+
+Our [`got_sorting_goo()`](got/tasks/sorting/graphs.py#L103) uses exactly these defaults.
+It is also the single biggest cost knob you have — see
+[§19.5](#195-the-cost-knobs-in-order-of-impact).
+
+And the caveat the paper itself attaches to Figure 4, which is worth quoting in your
+report because it licenses experimentation:
+
+> "Note that this is an example graph decomposition. **The structure of connections
+> between all operations can be arbitrarily modified.**"
+
+---
+
+### 17.9 §5.2–5.4 The other three use cases
+
+**§5.2 Set intersection.**
+
+> "Set intersection of two sets is implemented similarly as the sorting. The second input
+> set is split into subsets and the intersection of those subsets with the first input set
+> is determined with the help of the LLM. Afterwards the resulting intersection sets are
+> aggregated for the final results."
+
+Note the asymmetry: only $B$ is split, and each subset is intersected against the *whole*
+of $A$. Since $(A \cap B_1) \cup (A \cap B_2) = A \cap (B_1 \cup B_2)$, the merge step is
+a **union**, not an intersection — an easy thing to get backwards when implementing. Sizes
+32/64/128, with overlap deliberately varied between 25% and 75%.
+
+Its error-scope has three terms rather than two:
+
+$$\text{error-scope} = X_1 + X_2 + X_d$$
+
+- $X_1 = |C \setminus (A \cap B)|$ — elements that should not be there
+- $X_2 = |(A \cap B) \setminus C|$ — elements missing
+- $X_d$ — duplicates, *"because the LLM expresses the set as a list in natural language"*
+
+That third term is a lovely detail: the model has no set type, only text, so it can emit
+the same element twice and you must penalise it explicitly.
+
+**§5.3 Keyword counting.** Count country mentions in a text. Split into passages, count
+per passage, aggregate the dictionaries. Score = sum of absolute differences from the true
+counts. Note the paper's remark that the number of passages *"can also be left to the
+LLM"* — the decomposition itself becomes a model decision.
+
+**§5.4 Document merging.** Merge several overlapping NDAs into one. This is the only task
+where scoring must use the LLM:
+
+> "we query the LLM for two values (3 times for each value, and take the average). The
+> first value corresponds to the solution **redundancy** (10 indicates no redundancy),
+> the second value stands for **information retention** (10 indicates all information is
+> retained). We compute the **harmonic mean** of these values."
+
+Harmonic mean, not arithmetic — so you cannot win by maximising one and ignoring the
+other. Copying all documents verbatim gives perfect retention and terrible redundancy;
+the harmonic mean punishes that correctly.
+
+*Status in our repo:* sorting and set intersection are both implemented across **all five
+schemes** (IO, CoT, CoT-SC, ToT, GoT), so either can produce a full paper-style comparison:
+
+```bash
+python scripts/run_benchmark.py --task set_intersection \
+    --data data/set_intersection/set_intersection_32.csv \
+    --schemes io cot cot_sc tot got --backend mock --out results/si
+```
+
+Keyword counting and document merging have datasets generated but no GoO builder yet.
+That scoping is defensible for a B.Tech replication — say so explicitly rather than
+leaving it implicit.
+
+---
+
+### 17.10 §6 The Latency–Volume Tradeoff ★ — the theory result
+
+Two definitions, and the second one is the invented quantity:
+
+> "**latency** (number of hops in the graph of thoughts to reach a given final thought)"
+
+> "We define **volume** — for a given thought $t$ — as the number of preceding LLM
+> thoughts that could have impacted $t$. Formally, the volume of $t$ is the number of
+> thoughts from which there exists a path to $t$ in the graph of thoughts."
+
+*Plain English:*
+
+- **Latency** = depth = how many sequential model calls before you can finish. This is
+  wall-clock time, because step $i+1$ cannot start until step $i$ finishes.
+- **Volume** = how many earlier thoughts could have contributed to the final answer. This
+  is a proxy for "how much of the work you paid for actually reached the result".
+
+You want **high volume** (use everything you computed) and **low latency** (finish fast).
+These normally trade off, and Table 2 is the claim that GoT breaks the tradeoff:
+
+| Scheme | Latency | Volume |
+|---|---|---|
+| CoT | $N$ | $N$ |
+| CoT-SC | $N/k$ | $N/k$ |
+| ToT | $\log_k N$ | $O(\log_k N)$ |
+| **GoT** | $\log_k N$ | $N$ |
+
+Read the rows as a story:
+
+- **CoT** — one long chain. Everything feeds forward (volume $N$), but you wait $N$ steps.
+- **CoT-SC** — $k$ short chains. You wait $k$ times less, but each chain only sees its own
+  $N/k$ thoughts. **The other chains' work is thrown away.** You paid for $N$ thoughts and
+  used $N/k$.
+- **ToT** — a $k$-ary tree. Shallow, so latency $\log_k N$. But the final answer is one
+  leaf, and only its ancestors could have influenced it — that is one root-to-leaf path,
+  $O(\log_k N)$ thoughts. **The overwhelming majority of the tree is wasted**: a complete
+  $k$-ary tree with $N$ nodes has $\sim N(1 - 1/k)$ leaves, and all but one are discarded.
+- **GoT** — a tree joined at its leaves to a mirrored, edge-reversed tree. A diamond.
+  Depth is still $\log_k N$, but now *every* thought has a path to the root, because the
+  merges pull everything back in. Volume $N$ at latency $\log_k N$.
+
+The paper's own summary:
+
+> "GoT is the only scheme to come with both a low latency of $\log_k N$ and a high volume
+> $N$. This is enabled by the fact that **GoT harnesses aggregations of thoughts**, making
+> it possible to reach the final thought from any other intermediate thought."
+
+**This is worth internalising as the economic argument for the paper.** All four schemes
+are given the same budget $\Theta(N)$. They differ only in what fraction of that budget
+can reach the answer. GoT's answer is "all of it".
+
+Our [`metrics.py`](got/metrics.py) computes both quantities by reachability on the actual
+produced graph, and the measured numbers match the table — 32-element sorting gives GoT
+volume 18 at latency 7, against ToT's volume 6 at latency 6. See
+[§9.4](#94-empirical-verification).
+
+**The honest caveat**, which you should raise before an examiner does: volume counts
+*potential* influence, not *useful* influence. A thought that reaches the root through a
+merge that ignored it still counts. Volume is a structural upper bound on information
+flow, not a measurement of it.
+
+---
+
+### 17.11 §7 Evaluation — the experimental setup
+
+**§7.1 Methodology.** The numbers you need to match for a fair replication:
+
+> "We use **100 input samples** for each task and comparison baseline. We set the
+> **temperature to 1.0** and use a **4k context size** unless stated otherwise. For each
+> experiment, we **fix the numbers of thoughts in respective schemes to achieve similar
+> costs**."
+
+That last clause is the fairness condition, and it is the easiest thing to get wrong.
+You are not allowed to give GoT more thoughts than ToT and then declare victory — the
+comparison is at *matched cost*. Our README flags exactly this as an open weakness: our
+ToT baseline is leaner than the paper's, so our token comparison is not yet apples to
+apples. Fixing that on HPC means running the paper's wider ToT configurations (their
+ToT and ToT2, varying $k$ and $L$).
+
+**§7.1 Models** — the answer to "which model did they use":
+
+> "**Due to budget restrictions, we focus on GPT-3.5.** We also experimented with
+> **Llama-2**, but it was usually worse than GPT-3.5 and also much slower to run, making
+> it infeasible to obtain enough samples."
+
+So: GPT-3.5 (specifically ChatGPT-3.5) for every headline figure, with Llama-2 tried and
+abandoned for cost and speed reasons. See [§19](#19-models-and-vllm) for what we use
+instead and why the substitution is defensible.
+
+**§7.2 Results.** Figures 5–8 plot error-scope and cost for each task. The headline:
+
+> "Overall, GoT improves the quality of outcomes over all the considered baselines and it
+> reduces inference costs compared to ToT." — with sorting quality up **62%** over ToT and
+> cost down **>31%**.
+
+The mechanism behind the cost reduction is worth stating because it is counter-intuitive:
+GoT does *more* LLM calls than ToT but at *lower total cost*, because each call is on a
+much shorter input. A tree at depth $L$ is still passing the full-length list around;
+GoT's chunk calls handle 16 elements instead of 64. Tokens, not calls, are the bill.
+
+**§7.3 Discussion on Task Decomposition** — the most practically useful prose in the
+paper, and the part that tells you how to pick $m$:
+
+> "The overall goal when conducting graph decomposition is to **break down a task to the
+> point where the LLM can solve it correctly for the majority of time using a single
+> prompt** (or with a few additional improvement steps)."
+
+> "combining or concatenating subresults is usually **an easier task than solving large
+> task instances from scratch**. Hence, the LLM is often successful when aggregating the
+> final solution."
+
+Those two sentences are the entire justification for the method, in plain language. And
+the countervailing force, which is why you cannot just split forever:
+
+> "the 'static' part of the prompt (i.e., few-shot examples) may become a significant
+> overhead (see GoT4 to GoT8 in Figure 7)."
+
+Split into $m$ chunks and you pay the few-shot example $m$ times. So there is an interior
+optimum in $m$ — derived formally in [§7.4](#74-why-there-is-an-optimum-m).
+
+---
+
+### 17.12 §8–9 Related Work and Conclusion
+
+§8 positions GoT against other prompting paradigms, self-reflection work, and (§8.3–8.4)
+more distant relatives like graph neural networks. The claim to note is that GoT is a
+*superset*, not an alternative — it can express CoT, CoT-SC and ToT as special cases,
+which is why the comparison is meaningful rather than apples-to-oranges.
+
+§9 restates the contributions. Nothing new.
+
+---
+
+### 17.13 Appendix — the part nobody reads and you should
+
+The appendix contains **the actual prompts**, verbatim, for all four use cases. If your
+open-weights model produces badly formatted output on HPC, this is the first place to
+look. It also contains full worked examples of keyword counting showing each operation's
+input and output — the fastest way to understand the flow concretely.
+
+Our prompts in [`prompts.py`](got/tasks/sorting/prompts.py) are deliberately **terser**
+than the paper's. The paper prompts GPT-3.5, which tolerates chatty instructions; a 7B
+open model does not, and will pad its answer with prose that breaks parsing. That is a
+documented deviation, not an oversight — see [§14.6](#146-defensive-parsing).
+
+---
+
+### 17.14 The five sentences that carry the paper
+
+If you remember nothing else:
+
+1. **"A directed edge $(t_1,t_2)$ indicates that thought $t_2$ has been constructed using
+   $t_1$ as direct input."** — edges are data dependencies, which is what makes volume
+   meaningful.
+2. **Aggregation creates a vertex with in-degree $k>1$, and a tree cannot have one.** —
+   the contribution, as a theorem.
+3. **"GoO is a static structure ... GRS is a dynamic structure."** — the architectural
+   split that shapes any implementation.
+4. **"GoT is the only scheme to come with both a low latency of $\log_k N$ and a high
+   volume $N$."** — the theory result.
+5. **"Break down a task to the point where the LLM can solve it correctly for the majority
+   of time using a single prompt."** — the design rule, and the answer to "how do I choose
+   the decomposition?"
+
+---
+
+## 18. Datasets — which ones, and where they come from
+
+### 18.1 The short answer: there is no dataset to download
+
+This surprises most people on first reading, so state it clearly in your report:
+
+> **The GoT paper does not use any public benchmark dataset. All four of its tasks are
+> synthetic and generated from scratch.**
+
+There is no GSM8K, no HotpotQA, no HuggingFace download. There is no file on the
+spcl/graph-of-thoughts repository that you fetch. Every input is produced by a random
+generator, and the ground-truth answer is computed directly rather than annotated by
+humans.
+
+**Why the authors did it this way** — and this is a genuinely good design choice worth
+defending:
+
+| Reason | Explanation |
+|---|---|
+| **Ground truth is free and exact** | The correct sorting of a list is computable. No human labels, no ambiguity, no annotator disagreement. |
+| **Difficulty is a dial** | Want harder? Increase $n$ from 32 to 64 to 128. You get a clean difficulty axis, which is what Figures 5–8 plot along. |
+| **No contamination** | A randomly generated list cannot have been in the model's training data. With a public benchmark you can never rule out memorisation. |
+| **The failure is isolated** | Sorting needs no world knowledge, no commonsense, no arithmetic. It isolates exactly the working-memory failure the paper is attacking. |
+
+That last point is the strongest. If GoT improved GSM8K scores you would not know whether
+it helped *reasoning* or just gave the model more chances to recall a memorised answer.
+With random digit lists, there is nothing to recall.
+
+### 18.2 The four datasets, precisely as the paper specifies them
+
+| Task | Paper § | Input | Sizes | Ground truth |
+|---|---|---|---|---|
+| **Sorting** | 5.1 | list of digits 0–9, **with duplicates** | 32, 64, 128 | `sorted(input)` |
+| **Set intersection** | 5.2 | two sets, overlap varied **25%–75%** | 32, 64, 128 | `set(a) & set(b)` |
+| **Keyword counting** | 5.3 | passages mentioning countries | 4, 8, 16 sentences | true country counts |
+| **Document merging** | 5.4 | several partially overlapping NDAs | 4 documents | *none* — LLM-scored |
+
+Two details that are easy to miss and that matter:
+
+- **"with duplicates" in sorting is the whole point.** Digits 0–9 into a 64-element list
+  means an average of 6.4 copies of each digit. Sorting *distinct* numbers would be much
+  easier — the model could not lose count. Duplicates are what create the failure mode
+  described in [§0.9](#09-why-llms-are-bad-at-sorting--the-motivating-failure).
+- **Document merging has no computable ground truth.** That is why §5.4 scores with the
+  LLM (redundancy and retention, harmonic mean). It is the one task where you cannot grade
+  automatically, which is why it is the last one to implement.
+
+### 18.3 How to generate them in this repo
+
+One command:
+
+```bash
+python scripts/generate_data.py --out data --seed 42 --n-samples 100 --small
+```
+
+| Flag | Meaning |
+|---|---|
+| `--seed 42` | fixes the RNG — **byte-identical files every time**, on any machine |
+| `--n-samples 100` | instances per configuration; 100 is the paper's number (§7.1) |
+| `--small` | additionally emit 5-instance files under `data/smoke/` for fast checks |
+| `--out data` | destination directory |
+
+The `--seed` flag matters more than it looks. It means the dataset you generate on your
+laptop and the dataset the HPC generates are the same bytes, so you can compare a mock run
+against a GPU run instance by instance. Do not skip it, and do not change it mid-project.
+
+**What comes out:**
+
+```
+data/
+├── sorting/
+│   ├── sorting_32.csv          100 instances
+│   ├── sorting_64.csv          100 instances   <- the paper's headline size
+│   └── sorting_128.csv         100 instances
+├── set_intersection/
+│   ├── set_intersection_32.csv
+│   ├── set_intersection_64.csv
+│   └── set_intersection_128.csv
+├── keyword_counting/
+│   ├── keyword_counting_4.csv
+│   ├── keyword_counting_8.csv
+│   └── keyword_counting_16.csv
+├── document_merging/
+│   └── document_merging_4.csv
+└── smoke/                      5 instances each -- for local validation
+    ├── sorting_32_small.csv
+    ├── set_intersection_32_small.csv
+    └── keyword_counting_4_small.csv
+```
+
+### 18.4 The file format
+
+Plain CSV, one problem instance per row, with the answer included:
+
+```csv
+id,length,input,answer
+0,32,"[1, 0, 4, 3, 3, ...]","[0, 0, 0, 0, 0, 1, ...]"
+1,32,"[2, 3, 5, 1, 1, ...]","[0, 0, 1, 1, 1, 1, ...]"
+```
+
+Set intersection carries a little more:
+
+```csv
+id,size,set_a,set_b,overlap_fraction,answer
+0,32,"[122, 109, 12, ...]","[26, 40, 103, ...]",0.525,"[4, 12, 17, 20, ...]"
+```
+
+The list-valued columns are JSON, so `json.loads(row["input"])` reads them back. Shipping
+the answer in the file is what lets the harness compute true accuracy without an oracle —
+`correct` in the results CSV is literally `produced == instance["answer"]`.
+
+### 18.5 Which one to actually run
+
+For your replication, in order:
+
+1. **`data/smoke/sorting_32_small.csv`** — 5 instances. Use with `--backend mock` to check
+   nothing is broken. Runs in under a second. Do this after every code change.
+2. **`data/sorting/sorting_32.csv`** with `--limit 10` — your first real-model run on the
+   GPU. Small enough that a mistake costs minutes, not hours.
+3. **`data/sorting/sorting_64.csv`** with `--limit 100` — **this is the paper's headline
+   configuration** (Figure 5, 64 elements, 100 samples). This is the run that produces your
+   comparable result.
+4. **`data/sorting/sorting_128.csv`** — the stress case, if you have GPU budget left.
+5. **`data/set_intersection/set_intersection_32.csv`** — second task, to show the method
+   generalises beyond sorting.
+
+Start at 64 elements, not 128. At 32 elements a decent model may already sort correctly
+most of the time, which compresses the gap between schemes and makes your plots boring.
+64 is where the paper's own figures show the clearest separation.
+
+---
+
+## 19. Models and vLLM
+
+### 19.1 Which model did the paper use?
+
+Directly from §7.1, under "Used LLMs":
+
+> "**Due to budget restrictions, we focus on GPT-3.5.** We also experimented with
+> **Llama-2**, but it was usually worse than GPT-3.5 and also much slower to run, making
+> it infeasible to obtain enough samples."
+
+So every headline figure in the paper (Figures 5–8) is **ChatGPT-3.5**, accessed through
+the OpenAI API, at temperature 1.0 with a 4k context. Llama-2 was tried and dropped.
+
+Two consequences for your replication:
+
+1. **You cannot reproduce their exact numbers.** GPT-3.5 is a closed, paid API, and the
+   specific snapshot they used has since been deprecated. Even with an API key you would
+   be querying a different model. This is not a flaw in your work — it is a well-known
+   reproducibility problem with closed-model papers, and it is worth one paragraph in your
+   report.
+2. **You should therefore replicate the *claims*, not the *digits*.** The paper's claims
+   are relative: GoT beats ToT beats CoT-SC beats CoT beats IO, at matched cost. That
+   ordering is what you test, on whatever model you can run.
+
+### 19.2 Which models do *we* use, and why
+
+This project is deliberately **API-key-free**: everything runs on open-weights models you
+download and execute yourself. Three backends cover three hardware situations, all behind
+one interface ([`AbstractLanguageModel`](got/backends/base.py)), so the task code never
+changes.
+
+| Backend | Hardware | Model | What it is for |
+|---|---|---|---|
+| `mock` | anything | none | validating graph logic — free, instant, deterministic |
+| `llamacpp` | laptop CPU | Qwen2.5-1.5B-Instruct Q4 (~1 GB) | real-but-small end-to-end check |
+| `hf` | 1 GPU | Llama-3.1-8B, Qwen2.5-7B | single-GPU runs, supports 4-bit |
+| `vllm` | 1–8 GPUs | up to Llama-3.1-70B | **fast runs — this is the one for real results** |
+
+**Pick your model by GPU memory:**
+
+| GPU RAM | Model | Flags |
+|---|---|---|
+| 16 GB | `Qwen/Qwen2.5-7B-Instruct` | `--backend hf --load-in-4bit` |
+| 24 GB | `meta-llama/Llama-3.1-8B-Instruct` | `--backend vllm` |
+| 40 GB | `Qwen/Qwen2.5-32B-Instruct` | `--backend vllm` |
+| 80 GB | `meta-llama/Llama-3.1-70B-Instruct` | `--backend vllm --tensor-parallel-size 2` |
+
+**Recommendation: start with `Qwen/Qwen2.5-7B-Instruct`.** Two practical reasons —
+
+- It is **ungated**. Llama models require accepting a licence on HuggingFace and running
+  `huggingface-cli login`; if the token is missing your SLURM job dies after queueing.
+  Qwen needs nothing.
+- It is comfortably above the ~10B scale where chain-of-thought behaviour becomes
+  reliable, so your quality numbers will be meaningful rather than noise.
+
+Llama-3.1-8B is the better model if you can get access. Run both if GPU budget allows —
+"the ordering held across two model families" is a stronger result than one model.
+
+### 19.3 What is vLLM?
+
+**vLLM is a serving engine for LLM inference.** It is not a model. It is the software that
+*runs* a model fast. Think of it as the difference between a car engine (the model) and a
+racetrack pit crew (vLLM) — same engine, far better lap times.
+
+You could run Llama-3.1-8B with plain HuggingFace `transformers`. It would work, and it
+would be roughly **5–20× slower** for our workload. Three reasons:
+
+**(a) Continuous batching.** Plain `transformers` processes a batch and waits for the
+*slowest* sequence in it to finish before starting the next batch. If 39 sequences finish
+in 20 tokens and one runs to 200, the GPU idles through 180 tokens' worth of time. vLLM
+retires finished sequences immediately and slots new ones into the free space.
+
+```
+Static batching:     [====][................idle................]
+                     [====][....][..........idle................]
+                     [========================================]   <- one slow one
+
+Continuous batching: [====][new][====][new][====][new][====][new]
+                     GPU stays saturated
+```
+
+**(b) PagedAttention.** While generating, the model stores a "KV cache" of everything it
+has attended to so far. Naively you allocate the maximum possible size for every sequence,
+and most of it is wasted. vLLM borrows the idea of virtual memory paging from operating
+systems and allocates the cache in small blocks on demand. In practice this fits **2–4×
+more concurrent sequences** in the same GPU memory.
+
+**(c) Prefix caching.** ★ *This one matters enormously for GoT specifically.*
+
+Every prompt our sorting task sends begins with the same text — the instructions and the
+few-shot example. Only the input list at the end differs:
+
+```
+Sort the following list of numbers in ascending order.       |
+Output only the sorted list...                               |  IDENTICAL on
+Example:                                                     |  every single
+Input: [3, 7, 0, 2, 8, 1, 2, 2, 2, 4, 7, 8, 5, 5, 3, 9]      |  call
+Output: [0, 1, 2, 2, 2, 2, 3, 3, 4, 5, 5, 7, 7, 8, 8, 9]     |
+                                                             |
+Input: [4, 2, 9, 1]        <- only this differs
+Output:
+```
+
+With `enable_prefix_caching=True`, vLLM computes that shared prefix's KV cache **once** and
+reuses it for every subsequent call. Prefill cost collapses to just the differing tokens.
+
+This directly cancels the cost objection the GoT paper itself raises in §7.3 — that
+splitting into $m$ chunks makes you pay the few-shot example $m$ times. On vLLM with prefix
+caching, you pay it approximately once. **That is a genuinely interesting finding for your
+report:** a systems-level optimisation unavailable to the original authors (who paid per
+token through a closed API) materially changes the method's cost profile.
+
+**(d) Native $n>1$ sampling.** vLLM can generate $k$ different continuations from one
+prompt in a single call, sharing the prefill. This maps exactly onto our `Generate(k)`
+operation. Our [`VLLMLM`](got/backends/local_models.py#L290) sets
+`shares_prompt_across_samples = True` so token accounting charges the prompt once rather
+than $k$ times — otherwise the cost figures would be wrong.
+
+**Summary:** vLLM is what makes a 100-instance, 5-scheme GoT benchmark take single-digit
+minutes of GPU time instead of hours.
+
+### 19.4 Installing vLLM on the cluster
+
+```bash
+pip install vllm
+```
+
+It pulls in a CUDA build of PyTorch, so **do it inside your conda env on a node that can
+see a GPU**, and match the CUDA version your cluster's `module avail cuda` reports. In
+this repo it is bundled as an extra:
+
+```bash
+pip install -e ".[hpc]"      # vLLM + CUDA torch + bitsandbytes
+```
+
+If vLLM will not install (it is picky about CUDA versions), fall back to
+`--backend hf --load-in-4bit`. It is slower but has far fewer dependencies, and every
+result remains valid — only the wall-clock changes.
+
+### 19.5 The cost knobs, in order of impact
+
+Before you burn GPU hours, know which dial does what. From
+[§11](#11-cost-model), and confirmed by `scripts/estimate_cost.py`:
+
+| Knob | Effect | Note |
+|---|---|---|
+| `--aggregation-attempts` | **dominant** — it is the $k_a \log_2 m$ term | paper uses 10; try 5 first |
+| `--limit` | linear in instances | start at 10, not 100 |
+| `--branching-factor` | linear in $k$ | paper uses 3 |
+| input length (32/64/128) | superlinear via token counts | 64 is the headline |
+| `--num-chunks` | interior optimum, see [§7.4](#74-why-there-is-an-optimum-m) | must be a power of 2 |
+
+**Price the job before you queue it:**
+
+```bash
+python scripts/estimate_cost.py --data data/sorting/sorting_64.csv \
+    --limit 100 --model-size 8b --aggregation-attempts 10 5 3
+```
+
+This runs the *real* Graph of Operations on the free mock backend, so the prompt and batch
+counts it reports are exact; only throughput is modelled. Use it to choose
+`--aggregation-attempts` before committing.
+
+---
+
+## 20. GPU replication runbook
+
+There are **two kinds of machine** you might be given, and they need different workflows.
+Step 0 tells you which one you have. Everything after it splits into Path A (a scheduler)
+and Path B (a plain server) — read only your path.
+
+### Step 0 — Which kind of machine is this?
+
+```bash
+for c in sbatch srun squeue sinfo qsub bsub; do
+  printf "%-8s %s\n" "$c" "$(command -v $c || echo 'no')"
+done
+nvidia-smi
+which conda
+df -h ~
+```
+
+| What you see | What you have | Follow |
+|---|---|---|
+| `sbatch`/`sinfo` resolve to a path | **SLURM cluster** — shared, queued, allocation-billed | Path A |
+| all say `no`, but `nvidia-smi` works | **Plain GPU server** — you just run things | **Path B** |
+| `nvidia-smi` missing too | no GPU here; find the right host first | — |
+
+> **`sinfo: command not found` is an answer, not a problem.** It means there is no
+> scheduler, so there is nothing to install — `slurm-client` would give you commands with
+> no server to talk to. Likewise `module: command not found` simply means the machine does
+> not use environment modules; the CUDA runtime arrives with the pip `torch` wheel and the
+> driver is already installed system-wide. **Neither needs root, because neither is
+> needed.**
+
+### 20.0 Nothing in this project requires root
+
+Worth stating plainly, because it is the most common blocker:
+
+| Thing | Needs sudo? | Why not |
+|---|---|---|
+| conda env | no | installs under your home directory |
+| `pip install vllm`, torch, etc. | no | goes into your conda env, not `/usr` |
+| model weights | no | downloaded to `$HF_HOME`, which you choose |
+| running the benchmark | no | it is just `python` |
+| `slurm-client`, `module` | **not needed at all** | only relevant on a scheduler cluster |
+
+If conda itself is missing, miniconda installs into your home directory with no root:
+
+```bash
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3
+```
+
+---
+
+## Path B — a plain GPU server (no scheduler)
+
+This is the common case for a shared lab machine, and it is **simpler** than the cluster
+path: there is no queue, no partition, no account code, no `sbatch`. You run Python.
+
+### B1 — Clone and set up
+
+```bash
+git clone <your-repo-url> BTP && cd BTP
+
+# Use the conda you already have -- point CONDA_BASE at it if it is not in $HOME.
+# e.g. `which conda` -> /home/you/Some_Project/condabin/conda
+export CONDA_BASE=/home/you/Some_Project
+bash scripts/slurm/setup_hpc_env.sh
+```
+
+That script now auto-detects conda from your `PATH` and skips `module load` when there is
+no `module` command, so it works unmodified on a non-cluster box.
+
+If you already have a working env (say `GOTComp-cu121`), reuse it rather than creating a
+second one:
+
+```bash
+conda activate GOTComp-cu121
+pip install -e ".[hpc]"
+```
+
+### B2 — Prove the pipeline works, for free
+
+```bash
+python scripts/generate_data.py --out data --seed 42 --n-samples 100 --small
+
+python scripts/run_benchmark.py \
+    --task sorting --data data/smoke/sorting_32_small.csv --limit 5 \
+    --backend mock --schemes io cot cot_sc tot got --out results/smoke
+```
+
+Under a second, no GPU touched. If this prints a five-row table, your install is sound and
+any later failure is a model problem, not a code problem.
+
+### B3 — Check the GPU, and be a good citizen
+
+```bash
+nvidia-smi
+```
+
+On a shared server **other people are using these cards.** Read the memory column, pick a
+free one, and pin yourself to it:
+
+```bash
+export CUDA_VISIBLE_DEVICES=1        # use only GPU 1
+```
+
+`scripts/run_direct.sh` defaults to GPU 0; override this variable if 0 is busy. Taking a
+card someone else is mid-run on is the fastest way to lose server access.
+
+### B4 — Download the weights first, separately
+
+```bash
+export HF_HOME=$PWD/.hf_cache        # NOT your home dir if quota is tight
+mkdir -p $HF_HOME
+huggingface-cli download Qwen/Qwen2.5-7B-Instruct
+```
+
+~15 GB. Do it as its own step so a slow or interrupted download does not happen halfway
+through a benchmark run. Check you have the space first with `df -h`.
+
+### B5 — A small real-model trial
+
+```bash
+python scripts/run_benchmark.py \
+    --task sorting --data data/sorting/sorting_32.csv --limit 5 \
+    --backend vllm --model-id Qwen/Qwen2.5-7B-Instruct \
+    --schemes io got --out results/trial --verbose
+```
+
+You are checking three things in order: does the model load, does the parser get sensible
+output (read the raw completions under `--verbose`), and is `got` accuracy non-zero. Fix
+prompt/parsing problems *here*, where a mistake costs two minutes.
+
+### B6 — The real run, detached
+
+The one genuine hazard on a plain server is that **closing your laptop kills the job** —
+there is no scheduler holding it for you. Use the provided wrapper:
+
+```bash
+bash scripts/run_direct.sh --bg
+```
+
+It re-execs itself under `setsid nohup`, prints a PID and a logfile path, and survives
+disconnection. Then:
+
+```bash
+tail -f logs/got_sorting_64_<stamp>.log     # watch
+nvidia-smi                                  # confirm it is on the GPU
+kill <pid>                                  # stop it
+```
+
+Configure it entirely through environment variables — no file editing:
+
+```bash
+TASK=set_intersection LENGTH=32 bash scripts/run_direct.sh --bg
+MODEL_ID=Qwen/Qwen2.5-7B-Instruct AGG_K=5 bash scripts/run_direct.sh --bg
+BACKEND=mock LIMIT=5 bash scripts/run_direct.sh          # free dry run
+CUDA_VISIBLE_DEVICES=2 TP_SIZE=1 bash scripts/run_direct.sh --bg
+```
+
+> If `tmux` happens to be installed, `tmux new -s got` then running in the foreground is
+> even nicer — you can detach with `Ctrl-b d` and reattach with `tmux attach -t got`.
+> `run_direct.sh --bg` needs nothing installed, which is why it is the default advice.
+
+### B7 — Sweeps, cheaply
+
+Model loading dominates on a short run, so loop *inside* one process rather than
+relaunching:
+
+```bash
+for k in 3 5 10; do
+    AGG_K=$k OUTDIR=results/sweep_k$k bash scripts/run_direct.sh
+done
+```
+
+Run that under `--bg` once by wrapping it in its own script, or just start it inside tmux.
+
+---
+
+## Path A — a SLURM cluster
+
+Only if Step 0 showed `sbatch`. Everything below assumes you have `git clone`d the repo
+onto the cluster and have shell access to a login node. **Do not skip step A0** — the
+number one cause of wasted allocation is submitting a job that would have failed in the
+first second.
+
+### Step A0 — Find out what your cluster actually is
+
+```bash
+sinfo -s                      # partition names, node counts, time limits
+sinfo -o "%P %G %m %N"        # which partitions have GPUs, and what kind
+module avail cuda             # which CUDA versions exist
+which conda                   # where conda lives (or whether it does)
+sacctmgr show assoc user=$USER format=account,partition,qos   # your account code
+```
+
+You are looking for four things:
+
+| Need | Typical value | Goes into |
+|---|---|---|
+| GPU partition name | `gpu`, `gpuq`, `a100` | `#SBATCH --partition=` |
+| CUDA module name | `cuda/12.1`, `cuda/11.8` | `module load` line |
+| Account/project code | `btp_2026`, `cs_dept` | `#SBATCH --account=` |
+| Conda base path | `$HOME/miniconda3` | `CONDA_BASE` |
+
+### Step A1 — Clone and set up the environment
+
+```bash
+cd $HOME                      # or $SCRATCH if your home quota is small
+git clone <your-repo-url> BTP
+cd BTP
+
+bash scripts/slurm/setup_hpc_env.sh
+```
+
+That script creates the `BTP` conda env, installs CUDA PyTorch and vLLM, installs this
+package, and prints a verification block. **Read the verification block.** It should say:
+
+```
+torch          : 2.x.x+cu121
+CUDA available : True
+GPU count      : 1
+  GPU 0: NVIDIA A100-SXM4-40GB  42.9 GB
+vLLM           : 0.x.x
+got package    : 0.1.0
+```
+
+If `CUDA available : False`, you ran it on a login node with no GPU. That is fine for
+installation, but you must confirm on a compute node before trusting it:
+
+```bash
+srun --partition=gpu --gres=gpu:1 --time=00:10:00 --pty bash
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+> **If vLLM fails to install** — it is genuinely fussy about CUDA versions — do not fight
+> it. Use `--backend hf --load-in-4bit` instead. Slower, but every scientific result is
+> identical; only wall-clock changes.
+
+### Step A2 — Generate the data (on the cluster, not by copying)
+
+```bash
+python scripts/generate_data.py --out data --seed 42 --n-samples 100 --small
+```
+
+Generate it *there* rather than `scp`-ing your laptop's copy. With `--seed 42` the files
+are byte-identical either way, and generating locally avoids transfer mistakes.
+
+### Step A3 — Prove the pipeline works without touching a GPU
+
+```bash
+python scripts/run_benchmark.py \
+    --task sorting --data data/smoke/sorting_32_small.csv --limit 5 \
+    --backend mock --schemes io cot cot_sc tot got --out results/smoke
+```
+
+This takes under a second and costs nothing. If it prints a table with five rows, your
+install is sound and every subsequent failure is a GPU/model problem, not a code problem.
+**Always run this immediately after cloning.**
+
+### Step A4 — Pre-download the model weights ★
+
+This is the step people skip, and it is the most common cause of a wasted allocation. A
+7B model is ~15 GB. If the job downloads it *inside* the GPU allocation, you pay GPU
+time for a network transfer — and if your home quota is too small, the job dies partway
+through with the GPU still billed.
+
+```bash
+export HF_HOME=$SCRATCH/hf_cache          # NOT $HOME -- quotas are small
+mkdir -p $HF_HOME
+
+huggingface-cli download Qwen/Qwen2.5-7B-Instruct
+```
+
+Do this on a **login node**, where there is no GPU to waste.
+
+> For Llama models you must first accept the licence on the HuggingFace model page, then
+> `huggingface-cli login` with a token. **Qwen needs none of this** — which is why it is
+> the recommended starting model.
+
+### Step A5 — Price the job before you queue it
+
+```bash
+python scripts/estimate_cost.py --data data/sorting/sorting_64.csv \
+    --limit 100 --model-size 8b --aggregation-attempts 10 5 3
+```
+
+This executes the real Graph of Operations on the mock backend, so prompt and batch counts
+are exact. Use it to decide `--aggregation-attempts` — it is the dominant cost term, and
+dropping 10 → 5 roughly halves the bill.
+
+### Step A6 — An interactive trial run before batch submission
+
+Never let your first real-model run be a submitted batch job. Grab an interactive node:
+
+```bash
+srun --partition=gpu --gres=gpu:1 --cpus-per-task=8 --mem=64G \
+     --time=01:00:00 --pty bash
+
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate BTP
+export HF_HOME=$SCRATCH/hf_cache
+
+python scripts/run_benchmark.py \
+    --task sorting --data data/sorting/sorting_32.csv --limit 5 \
+    --backend vllm --model-id Qwen/Qwen2.5-7B-Instruct \
+    --schemes io got --out results/trial --verbose
+```
+
+Five instances, two schemes. You are checking three things, in this order:
+
+1. **Does the model load at all?** (memory, CUDA, weights present)
+2. **Does the parser get sensible output?** Use `--verbose` and read the raw completions.
+   This is where prompt problems surface — a 7B model may pad answers with prose that
+   breaks parsing. Fix the prompts *here*, cheaply.
+3. **Is `acc` non-zero for `got`?** If GoT is at 0% on 32 elements, something is wrong
+   with prompting or parsing, not with the method.
+
+**Budget real time for step 6.2.** Our prompts are tuned against the mock backend and a
+tiny local model; they have never met a real 7B model. Expect a round or two of
+adjustment. This is normal replication work, not failure.
+
+### Step A7 — Submit the real job
+
+Edit `scripts/slurm/run_got.sbatch` with the values from Step 0:
+
+```bash
+#SBATCH --partition=gpu          # <- from sinfo
+#SBATCH --account=your_code      # <- from sacctmgr (add this line if needed)
+#SBATCH --gres=gpu:1
+...
+module load cuda/12.1            # <- from module avail
+```
+
+Then submit:
+
+```bash
+mkdir -p logs
+sbatch scripts/slurm/run_got.sbatch
+```
+
+Override without editing the file:
+
+```bash
+sbatch --export=ALL,MODEL_ID=Qwen/Qwen2.5-7B-Instruct,LENGTH=64,LIMIT=100 \
+       scripts/slurm/run_got.sbatch
+```
+
+Monitor:
+
+```bash
+squeue -u $USER                  # queued / running
+tail -f logs/got_<jobid>.out     # live output
+scancel <jobid>                  # kill it
+sacct -j <jobid> --format=JobID,Elapsed,MaxRSS,State    # after it finishes
+```
+
+### Step A8 — The runs that make up the replication
+
+*(This table applies to Path B too — just substitute `bash scripts/run_direct.sh --bg`
+with the matching environment variables for each `sbatch` line.)*
+
+Submit these as separate jobs (or one job looping over configurations — cheaper, since
+the model loads once):
+
+| # | Configuration | What it establishes |
+|---|---|---|
+| 1 | sorting, 64 elements, 100 instances, all 5 schemes | **the headline result** — matches paper Figure 5 |
+| 2 | sorting, 32 and 128 | the difficulty trend across input size |
+| 3 | set intersection, 32, all schemes | the method generalises past sorting (Figure 6) |
+| 4 | sorting 64, `--aggregation-attempts 3 5 10` | the cost/quality tradeoff curve |
+| 5 | sorting 64, `--num-chunks 2 4 8` | the interior optimum in $m$ ([§7.4](#74-why-there-is-an-optimum-m)) |
+
+Run 1 is the one your report is built on. Runs 4 and 5 are what turn a replication into an
+*analysis* — they produce curves the original paper does not have, which is exactly the
+kind of contribution a B.Tech project should make.
+
+### Step A9 — Retrieve and plot
+
+```bash
+# on the cluster
+ls results/hpc_<jobid>/
+
+# from your laptop
+scp -r user@cluster:~/BTP/results/hpc_<jobid> results/
+
+# locally
+python scripts/visualize_graph.py --out docs/figures
+```
+
+Each run writes two files: a per-instance CSV (one row per instance per scheme, with the
+produced output, token counts, volume and latency) and a summary JSON.
+
+### 20.1 Failure modes, and what they actually mean
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `CUDA out of memory` at load | model too big for the card | `--load-in-4bit`, or a smaller model, or `--tensor-parallel-size 2` |
+| `CUDA out of memory` mid-run | too many concurrent sequences | lower `max_num_seqs`, or `--aggregation-attempts` |
+| Job dies instantly, empty log | bad partition or account code | recheck Step 0; read the `.err` file |
+| `401` / gated repo | Llama licence not accepted | `huggingface-cli login`, or switch to Qwen |
+| Disk quota exceeded | HF cache in `$HOME` | `export HF_HOME=$SCRATCH/hf_cache` |
+| `acc` is 0% everywhere | parser not matching model output | `--verbose`, read raw completions, fix prompts |
+| GoT slower than expected | batching not engaging | confirm `--backend vllm`, check `batch` column > 1 |
+| `ModuleNotFoundError: got` | package not installed in the env | `pip install -e .` inside the activated env |
+| `sinfo`/`sbatch: command not found` | **there is no scheduler** | nothing to install — use Path B |
+| `module: command not found` | machine does not use env modules | ignore it; CUDA comes with the torch wheel |
+| `subhanu is not in the sudoers file` | no root, as expected | you never need root — see [§20.0](#200-nothing-in-this-project-requires-root) |
+| Run dies when you close SSH | no scheduler holding the job | `bash scripts/run_direct.sh --bg`, or use tmux |
+| `CUDA out of memory` but your model is small | **someone else is on that GPU** | `nvidia-smi`, then pick a free card with `CUDA_VISIBLE_DEVICES` |
+
+### 20.2 Etiquette that will save you
+
+**On a shared GPU server (Path B):**
+
+- **Check `nvidia-smi` before every run** and pin yourself to a free card with
+  `CUDA_VISIBLE_DEVICES`. Defaulting to GPU 0 when someone else is mid-training on it is
+  the fastest way to lose access to the machine.
+- **Do not fill the shared disk.** Point `HF_HOME` somewhere you own, and delete model
+  caches you are done with (`du -sh $HF_HOME`).
+- **Detach long runs** so a dropped SSH session does not waste an hour of GPU.
+- **Loop inside one process** for sweeps — model loading costs minutes each time.
+
+**On a scheduler cluster (Path A):**
+
+- **Never run a model on a login node.** It is shared by everyone and you will be noticed.
+- **Batch configurations together.** If you submit ten one-minute jobs you pay the model
+  load ten times. One job looping over settings is far cheaper.
+- **Always set a `--time` limit you actually need.** Shorter requests schedule sooner.
+- **Keep the HF cache on scratch**, and know that scratch is often purged — do not store
+  results there.
+- **Save the SLURM job ID with every result.** `results/hpc_<jobid>/` already does this;
+  it is how you trace a number in your report back to the run that produced it.
 
 ---
 
