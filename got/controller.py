@@ -208,11 +208,18 @@ class Controller:
         """
         thoughts = self.all_thoughts()
         n_edges = sum(len(t.predecessors) for t in thoughts)
+        n_invalid = sum(1 for t in thoughts if not t.valid)
         return {
             "n_operations": len(self.execution_order),
             "n_thoughts": len(thoughts),
             "n_edges": n_edges,
             "n_aggregations": sum(1 for t in thoughts if t.is_aggregate),
+            # Share of thoughts the Parser could not read. A run can report a
+            # plausible-looking accuracy while this is near 1.0 -- that is a
+            # broken pipeline, not a weak model, and it is the first number to
+            # check when results look bad.
+            "n_invalid": n_invalid,
+            "invalid_rate": round(n_invalid / len(thoughts), 3) if thoughts else 0.0,
             "elapsed_seconds": round(self.elapsed, 3),
         }
 

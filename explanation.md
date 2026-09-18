@@ -40,6 +40,8 @@ Chain-of-Thought  →  Tree of Thoughts  →  Graph of Thoughts
 18. [Datasets — which ones, and where they come from](#18-datasets--which-ones-and-where-they-come-from)
 19. [Models and vLLM](#19-models-and-vllm)
 20. [GPU replication runbook](#20-gpu-replication-runbook) — plain server **or** SLURM cluster
+21. [The algorithm for building nodes and edges](#21-the-algorithm-for-building-nodes-and-edges)
+22. [The replication protocol](#22-the-replication-protocol)
 
 ---
 
@@ -1438,6 +1440,58 @@ built a fresh state dict and dropped that key. All sorted chunks fell into one g
 `sorted(numbers)` caught it immediately — which is the argument for having that test at
 all.
 
+### Bug 5 — the graph silently collapsed on the first real-model run ★
+
+The most instructive bug in the project, because **nothing failed**. The first HPC run
+against Qwen2.5-7B on 64-element sorting produced a complete, plausible-looking table:
+
+```
+scheme       acc      err     tokens   calls   batch    vol    lat
+io         0.00%    27.34        493     1.0     1.0    1.0    1.0
+cot        0.00%    18.32       1106     2.0     2.0    2.0    2.0
+cot_sc     0.00%    58.90        811     1.0     1.0    1.1    1.1   <- vol should be 2.0
+tot        0.00%    62.45        869     1.1     1.1    1.2    1.2   <- should be 3.0 / 6.0
+got        0.00%    23.69       5401     7.0     3.0   17.5    6.8
+```
+
+**Symptom:** 0% everywhere, and `cot_sc`/`tot` scoring *worse* than the IO baseline —
+refinement apparently making answers twice as bad. The tempting read is "a 7B model is
+just too weak" ([§3.4](#34-results-and-the-emergence-threshold) even predicts it).
+
+That read is wrong, and the `vol`/`lat` columns are what prove it. ToT executed **1.1 LLM
+calls against a graph specifying 3**, and its latency was 1.2 where the structure demands
+6. Those are *structural* quantities: they cannot change with model quality. A weak model
+produces bad answers, not a smaller graph. So the graph itself had been truncated.
+
+**Cause — a three-link chain, none of which raised anything:**
+
+1. `token_budget(n) = 2n + 32` gave a 64-element answer 160 tokens. The digits alone need
+   ~130, so any preamble ("Here is the sorted list:") ran the generation into the cap.
+2. A truncated list has no closing `]`. `extract_list`'s regex required one, returned
+   `None`, and the thought was marked `valid=False`.
+3. `KeepBest` filtered to `[t for t in inputs if t.valid]` and **returned `[]`** when none
+   survived. Every downstream operation then had no input thoughts and did nothing.
+
+The diagnostic signature is exact: **every scheme containing `KeepBest` collapsed, and
+`cot` — the only multi-call scheme without one — survived.** GoT partly survived because
+its chunk sorts are only 16 elements and fit the budget; only its final 64-element merge
+truncated.
+
+**Fix:** all three links. `extract_list` now salvages a truncated list (dropping the last
+number, which may be a half-emitted digit); `KeepBest` and `KeepBestPerGroup` fall back to
+the best *invalid* thought rather than returning nothing; `token_budget` became `3n + 64`.
+Generation stops at the stop string regardless, so an unused ceiling costs nothing —
+**bias budgets high**.
+
+**Lesson, and it is the big one:** a benchmark that cannot distinguish "the model did
+badly" from "the harness did not run" is worse than no benchmark, because it produces
+numbers you might publish. The mock backend could never have caught this — mock output
+always parses. The guard is to assert on quantities that are *independent of model
+quality*: the runner now prints a `bad%` column and raises a `PIPELINE WARNING` whenever
+parse failures exceed 30% or measured latency falls below what the graph specifies. Those
+checks are the first thing to read in any result table
+([§22.2](#222-before-you-run-anything-verify-the-pipeline-is-not-broken)).
+
 ---
 
 ## 16. What I verified, and what I did not
@@ -2097,17 +2151,42 @@ If you remember nothing else:
 
 ## 18. Datasets — which ones, and where they come from
 
-### 18.1 The short answer: there is no dataset to download
+### 18.1 The short answer: synthetic data, but the authors ship their exact files
 
-This surprises most people on first reading, so state it clearly in your report:
+Two facts, and you need both:
 
-> **The GoT paper does not use any public benchmark dataset. All four of its tasks are
-> synthetic and generated from scratch.**
+> **The GoT paper uses no public benchmark dataset — all four tasks are synthetic.**
+> **But the authors do ship the exact CSVs they ran, in their repo.**
 
-There is no GSM8K, no HotpotQA, no HuggingFace download. There is no file on the
-spcl/graph-of-thoughts repository that you fetch. Every input is produced by a random
-generator, and the ground-truth answer is computed directly rather than annotated by
-humans.
+There is no GSM8K, no HotpotQA, no HuggingFace download. Every input is produced by a
+random generator and the ground truth is computed, not annotated. *However*,
+[spcl/graph-of-thoughts](https://github.com/spcl/graph-of-thoughts) commits the generated
+files under `examples/`, so you can run on the authors' precise inputs:
+
+| Path in their repo | File | Rows |
+|---|---|---|
+| `examples/sorting/` | `sorting_032.csv`, `sorting_064.csv`, `sorting_128.csv` | ~100 each |
+| `examples/set_intersection/` | `set_intersection_032/064/128.csv` | 100 each |
+| `examples/keyword_counting/` | `countries.csv` | — |
+| `examples/doc_merge/` | `documents.csv`, `pure_documents.json` | — |
+
+**Use theirs.** It costs nothing and it removes "different random data" as an explanation
+for any gap between your numbers and the paper's. They are mirrored in this repo under
+`data/official/`, and both CSV layouts are accepted by the runner:
+
+```bash
+python scripts/run_benchmark.py --task sorting \
+    --data data/official/sorting/sorting_064.csv --limit 100 \
+    --backend vllm --model-id Qwen/Qwen2.5-7B-Instruct \
+    --schemes io cot cot_sc tot got --out results/official_64
+```
+
+Their schema is `ID,Unsorted,Sorted` (sorting) and `ID,SET1,SET2,INTERSECTION` (set
+intersection); ours is `id,length,input,answer`. `run_benchmark.py` sniffs the columns and
+accepts either, so no conversion step is needed.
+
+Keep `scripts/generate_data.py` anyway — it is what lets you test sizes and overlap ratios
+the authors did not publish, which is where a replication can add something new.
 
 **Why the authors did it this way** — and this is a genuinely good design choice worth
 defending:
@@ -2822,6 +2901,402 @@ produced output, token counts, volume and latency) and a summary JSON.
   results there.
 - **Save the SLURM job ID with every result.** `results/hpc_<jobid>/` already does this;
   it is how you trace a number in your report back to the run that produced it.
+
+---
+
+## 21. The algorithm for building nodes and edges
+
+This is the question everyone asks second, after "what is a graph of thoughts". The
+answer has **two halves**, because there are two graphs, and confusing them is the single
+most common source of implementation bugs.
+
+```
+GoO — Graph of OPERATIONS          GRS — Graph Reasoning STATE
+nodes = operations                 nodes = thoughts (LLM outputs)
+YOU build it, by hand, upfront     THE ENGINE builds it, automatically, at runtime
+"split, sort, merge, merge"        the 39 actual lists that got produced
+one per task configuration         one per input instance
+```
+
+You write the algorithm for the first. The second is built *for* you by a single generic
+loop. Both are below.
+
+---
+
+### 21.1 Part one — building the GoO (you write this)
+
+**Nodes** are `Operation` objects. **Edges** are `add_predecessor()` calls. That is all.
+
+```python
+root = InputOp({"current": numbers})          # node
+gen  = Generate("sort", branching_factor=3)   # node
+gen.add_predecessor(root)                     # edge: root -> gen
+```
+
+There are exactly two idioms for wiring, and the official
+[spcl/graph-of-thoughts](https://github.com/spcl/graph-of-thoughts) repo provides one
+method for each:
+
+| Idiom | Official API | Ours | Use when |
+|---|---|---|---|
+| chain onto the end | `append_operation(op)` — links to **all current leaves** | `op.add_predecessor(prev)` | linear stretches |
+| explicit wiring | `add_operation(op)` — respects predecessors you already set | `add_predecessor` on each parent | fan-in / fan-out |
+
+The official `append_operation` keeps a `roots` and a `leaves` list and does the
+bookkeeping for you; ours keeps predecessor lists on the operations themselves and
+derives the order by topological sort. The two are equivalent — the graph is the same
+object, only the convenience layer differs.
+
+**The algorithm, for the GoT merge-tree shape (paper Figure 4):**
+
+```
+BUILD-GOT-GOO(input, m, k, k_a):
+    # m = number of chunks (power of 2), k = sortings per chunk,
+    # k_a = aggregation attempts per merge
+
+    root  <- InputOp(input)
+    split <- Generate("split", k=1)          # local, no LLM call
+    edge(root -> split)
+
+    gen   <- Generate("sort", k)             # 1 -> k fan-out, batched over chunks
+    edge(split -> gen)
+    sc    <- Score(exact_scorer)
+    edge(gen -> sc)
+    level <- KeepBestPerGroup("chunk_index", n=1)     # m survivors
+    edge(sc -> level)
+
+    remaining <- m
+    depth     <- 0
+    while remaining > 1:                     # the binary merge tree
+        depth <- depth + 1
+        agg   <- PairwiseAggregate(k_a)      # <<-- THE FAN-IN. 2 -> 1 per pair
+        edge(level -> agg)
+        sc_m  <- Score(exact_scorer)
+        edge(agg -> sc_m)
+        remaining <- remaining / 2
+        keep  <- KeepBestPerGroup("_group", 1)  if remaining > 1
+                 else KeepBest(1)               # one global winner at the top
+        edge(sc_m -> keep)
+        level <- keep
+
+    gt <- GroundTruth(check)
+    edge(level -> gt)
+    return [gt]
+```
+
+That is literally [`got_sorting_goo()`](got/tasks/sorting/graphs.py#L103). The `while`
+loop is what produces the **diamond**: the fan-out happens once at `Generate`, then each
+iteration halves the number of surviving thoughts while doubling their length, until one
+remains.
+
+**Why the shape gives $\log_k N$ latency and $N$ volume:** the loop runs $\log_2 m$ times,
+so depth is logarithmic; and because every merge takes edges from *both* its inputs, every
+leaf keeps a path to the root, so volume stays $N$. Change `PairwiseAggregate` to
+`KeepBest` and you have destroyed exactly that property — you are back to a tree.
+
+---
+
+### 21.2 Part two — building the GRS (the engine does this)
+
+Now the part people actually mean by "the algorithm". Thoughts and their edges are
+created by one generic loop over the GoO:
+
+```
+EXECUTE(GoO, lm, prompter, parser):
+    V <- {}                                  # thoughts  (GRS vertices)
+    E <- {}                                  # dependencies (GRS edges)
+
+    for op in TOPOLOGICAL-ORDER(GoO):        # every predecessor runs first
+        parents <- concat(p.thoughts for p in op.predecessors)
+        new     <- op.EXECUTE(parents, lm, prompter, parser)
+        for t in new:
+            V <- V union {t}
+            for p in t.parents:              # set by the operation, see 21.3
+                E <- E union {(p, t)}
+        op.thoughts <- new                   # cached, so a shared op runs once
+    return (V, E)
+```
+
+Topological order is mandatory, not stylistic: an operation cannot run before the thoughts
+it consumes exist. With aggregation the GoO is a DAG rather than a chain, so "run things in
+the order I wrote them" is not sufficient — you must genuinely sort.
+
+In our code this is [`Controller.run()`](got/controller.py), and the edge wiring is the
+three lines of [`Operation._new_thought()`](got/operations.py#L127-L137):
+
+```python
+t = Thought(state=state, valid=bool(state.get("valid", True)), operation=operation)
+for p in parents:
+    t.add_predecessor(p)      # <-- every GRS edge in the system is created here
+return t
+```
+
+**Every edge in the reasoning graph is created by that one loop.** If a thought comes out
+with the wrong parents, this is the only place to look.
+
+---
+
+### 21.3 The per-operation rules — the actual table you need
+
+This is the heart of it. Each operation type has a fixed rule for how many nodes it
+creates and where the edges point:
+
+| Operation | Nodes created | Edges created | Shape |
+|---|---|---|---|
+| `InputOp` | 1 | none (it is the root) | • |
+| `Generate(k)` | $k$ per input thought | (input → each new) | 1 → k fan-out |
+| `Aggregate(k_a)` | $k_a$, each from **all** inputs | (**every** input → each new) | m → 1 fan-in ★ |
+| `PairwiseAggregate(k_a)` | $k_a$ per adjacent pair | (both members of the pair → each new) | 2 → 1 fan-in ★ |
+| `Improve` | 1 per input | (input → new) | 1 → 1 |
+| `Score` | **0** | none | mutates `.score` |
+| `KeepBest(n)` | **0** | none | filters the list |
+| `GroundTruth` | **0** | none | sets `.solved` |
+
+**Read the bold zeros carefully — they are the most misunderstood part of the framework.**
+`Score`, `KeepBest` and `GroundTruth` do not create thoughts and do not create edges. They
+are pure bookkeeping: `Score` writes a number onto existing thoughts, `KeepBest` returns a
+*subset* of the list it was given, `GroundTruth` sets a flag. None of them calls the LLM
+either ([§14.3](#143-structural-steps-do-not-call-the-llm)).
+
+Only **three** operations ever create a node: `Generate`, `Aggregate`, `Improve`. That is
+also exactly the paper's list of thought transformations in §3.2 — generation,
+aggregation, refinement. The correspondence is not a coincidence; it is the framework.
+
+**And the one rule that defines the whole paper:**
+
+```
+Aggregate: for each new thought v+, add an edge from EVERY input thought
+           =>  in-degree(v+) = number of inputs = k > 1
+           =>  the graph is NOT a tree          (trees require in-degree <= 1)
+```
+
+Generate gives you a tree. Aggregate is what makes it a graph. If you implement only
+Generate + Score + KeepBest you have built Tree of Thoughts, no matter what you call it.
+
+---
+
+### 21.4 Worked trace — 32 numbers, m=4, k=3, k_a=10
+
+Following the numbers all the way through, which is the fastest way to see the shape:
+
+| Step | Operation | Thoughts in | Thoughts out | Edges added | Running total |
+|---|---|---|---|---|---|
+| 1 | `InputOp` | — | 1 | 0 | 1 |
+| 2 | `Generate("split")` | 1 | 4 chunks | 4 | 5 |
+| 3 | `Generate("sort", k=3)` | 4 | 12 | 12 | 17 |
+| 4 | `Score` | 12 | 12 (same objects) | 0 | 17 |
+| 5 | `KeepBestPerGroup` | 12 | 4 | 0 | 17 |
+| 6 | `PairwiseAggregate(10)` | 4 | 20 (10 per pair) | **40** ★ | 37 |
+| 7 | `Score` → `KeepBestPerGroup` | 20 | 2 | 0 | 37 |
+| 8 | `PairwiseAggregate(10)` | 2 | 10 | **20** ★ | 47 |
+| 9 | `Score` → `KeepBest(1)` | 10 | 1 | 0 | 47 |
+
+Note step 6: 20 new thoughts but **40** edges — two per thought, because each merge takes
+from both inputs. That doubling is the fan-in, and it is the only place in the whole trace
+where edges outnumber nodes. Steps 4, 5, 7 and 9 add neither.
+
+Measured on the mock backend our GoT graph reports 39 thoughts and 15 aggregations at
+volume 18 / latency 7 — the counts differ from the idealised trace above because
+`KeepBest` prunes before the next level and invalid thoughts are dropped, but the
+*structure* is exactly this.
+
+---
+
+### 21.5 How the official repo differs from ours
+
+Worth knowing, because an examiner may have the repo open. Their
+`examples/sorting/sorting_032.py` builds its GoT graph as:
+
+```python
+plans = operations.Generate(1, 1)              # split into sublists
+operations_graph.append_operation(plans)
+
+for i in range(1, 3):                          # TWO sublists, not four
+    sub = operations.Selector(lambda thoughts, list_id=i: [
+        t for t in thoughts if t.state["part"] == f"List {list_id}"])
+    sub.add_predecessor(plans)
+    operations_graph.add_operation(sub)
+    operations_graph.append_operation(operations.Generate(1, 5))    # k=5
+    operations_graph.append_operation(operations.Score(1, False, utils.num_errors))
+    operations_graph.append_operation(operations.KeepBestN(1, False))
+
+final_aggregate = operations.Aggregate(10)     # k_a = 10
+operations_graph.append_operation(final_aggregate)
+operations_graph.append_operation(operations.Score(1, False, utils.num_errors))
+operations_graph.append_operation(operations.KeepBestN(1, False))
+
+operations_graph.append_operation(operations.Generate(1, 10))       # <-- refinement
+operations_graph.append_operation(operations.Score(1, False, utils.num_errors))
+operations_graph.append_operation(operations.KeepBestN(1, False))
+operations_graph.append_operation(operations.GroundTruth(utils.test_sorting))
+```
+
+Four differences from ours, and one of them is a genuine gap:
+
+| | Official (sorting_032) | Ours | Verdict |
+|---|---|---|---|
+| chunks | 2, via `Selector` on `state["part"]` | 4, via `KeepBestPerGroup` on `chunk_index` | equivalent; ours is batched, so cheaper on a GPU |
+| $k$ per chunk | 5 | 3 (Figure 4's value for 64) | both defensible; ours is the figure's number |
+| $k_a$ | 10 | 10 | same |
+| **post-merge refinement** | **`Generate(1,10)` + Score + KeepBest after the final aggregate** | **absent** | **a real gap — see below** |
+
+**The refinement pass is worth adding.** After the last merge, they generate 10 further
+*improvement* attempts on the merged result, score them, and keep the best. Our graph stops
+at the final `KeepBest`. Since merging is where errors concentrate, a corrective pass
+immediately after it is exactly where an improvement round pays for itself. Adding it means
+appending one `Improve` (or `Generate`) + `Score` + `KeepBest(1)` before `GroundTruth` in
+[`got_sorting_goo()`](got/tasks/sorting/graphs.py#L103) — roughly four lines.
+
+Their `Selector` is also a useful primitive we implement but barely use
+([`Selector`](got/operations.py#L678)): it filters the thought list by an arbitrary
+predicate, which is the general form of our `KeepBestPerGroup` grouping trick.
+
+---
+
+### 21.6 The five rules, compressed
+
+If you are asked "how do you build the graph", say this:
+
+1. **Two graphs, not one.** GoO = operations, static, hand-built. GRS = thoughts,
+   dynamic, engine-built.
+2. **GoO edges are `add_predecessor` calls.** Nodes are operation objects.
+3. **GRS is built by one loop** over the GoO in topological order; every edge in the
+   system is created in `_new_thought`.
+4. **Only Generate, Aggregate and Improve create nodes.** Score, KeepBest and GroundTruth
+   create none — they annotate and filter.
+5. **Aggregate draws an edge from every input**, giving in-degree > 1. That single rule is
+   what makes the structure a graph rather than a tree, and it is the paper's entire
+   contribution.
+
+---
+
+## 22. The replication protocol
+
+### 22.1 What "replicating the exact results" can and cannot mean
+
+Be precise about this in your report, because an examiner will ask and the honest answer
+is stronger than a vague one.
+
+**You cannot reproduce the paper's exact numbers.** Not because of anything you did wrong:
+
+- The paper's figures are all **ChatGPT-3.5** through a paid API (§7.1: *"Due to budget
+  restrictions, we focus on GPT-3.5"*). That specific snapshot has since been deprecated
+  and cannot be queried, at any price.
+- The model is closed. Even a live GPT-3.5 endpoint would not be the same weights.
+- Generation runs at **temperature 1.0**. The authors' own numbers would not reproduce
+  exactly on a rerun of their own code against their own model.
+
+So "62% improvement over ToT" is not a target you can hit. Anyone claiming an exact match
+on a closed-model paper is not measuring what they think they are.
+
+**What you replicate instead is the paper's claims**, which are all *relative* and all
+testable on any model:
+
+| # | Claim | Paper § | How you verify it | Needs a real LLM? |
+|---|---|---|---|---|
+| C1 | GoT is the only scheme that aggregates | 3.2 | `n_aggregations > 0` for GoT, `= 0` for all others | no |
+| C2 | GoT achieves volume $N$ at latency $\log_k N$ | 6, Table 2 | measured `vol`/`lat` columns | no |
+| C3 | GoT has the lowest error-scope | 7.2 | `err` column ordering | **yes** |
+| C4 | GoT beats ToT at **matched cost** | 7.1, 7.2 | `err` and `tokens` together | **yes** |
+| C5 | Decomposition has an interior optimum in $m$ | 7.3, 7.4 | sweep `--num-chunks` | **yes** |
+
+C1 and C2 are **structural** — they are properties of the graph, not the model, and the
+mock backend proves them exactly and for free. They are already established in this repo
+([§9.4](#94-empirical-verification)). C3–C5 need the GPU.
+
+**The strongest claim you can defend:** *"On an open-weights model the paper never tested,
+using the authors' own datasets, the qualitative ordering they report is reproduced, and
+the latency–volume theorem holds exactly."* That is a real replication result, and it is
+arguably more interesting than matching digits, because it tests whether the finding
+**generalises past the single closed model the paper used**.
+
+### 22.2 Before you run anything: verify the pipeline is not broken
+
+A benchmark can print a complete table of plausible numbers while being entirely broken.
+This happened on the first real run of this project — see
+[§15](#15-bugs-found-and-what-they-taught-me), Bug 5 — and cost 13 minutes of GPU time
+plus a misleading result.
+
+The runner now prints a `bad%` column and a loud `PIPELINE WARNING` block. **Check these
+before recording any number:**
+
+| Check | Healthy | Broken |
+|---|---|---|
+| `bad%` | < 5% | > 30% — the Parser cannot read the model |
+| `lat` for `tot` | ≈ 6 | ≈ 1 — operations silently did not run |
+| `lat` for `got` | ≈ 7 | ≈ 1 |
+| `vol` for `got` | ≈ 18 | ≈ 1 |
+
+If anything is off, rerun 3 instances with `--verbose` and **read the raw completions**.
+Fix prompts or `token_budget` before spending GPU hours. A low accuracy with a healthy
+`bad%` is a real result; a low accuracy with a high `bad%` is a bug.
+
+### 22.3 The run matrix
+
+Every run uses the **official datasets** (`data/official/`), 100 instances, temperature
+1.0 — matching §7.1. Number them; your report refers to these.
+
+| Run | Command flags | Establishes | GPU |
+|---|---|---|---|
+| **R0** | `--backend mock --schemes io cot cot_sc tot got` | C1, C2 structurally; free sanity check | none |
+| **R1** ★ | `--task sorting --data data/official/sorting/sorting_064.csv --limit 100 --schemes io cot cot_sc tot got` | **C3, C4 — the headline** (paper Fig. 5) | ~5 min |
+| **R2** | as R1 with `sorting_032.csv`, `sorting_128.csv` | difficulty trend across $n$ | ~8 min |
+| **R3** | `--task set_intersection --data data/official/set_intersection/set_intersection_032.csv` | generalises past sorting (Fig. 6) | ~5 min |
+| **R4** | R1 with `--aggregation-attempts 3`, `5`, `10` | C4 cost/quality curve | ~10 min |
+| **R5** | R1 with `--num-chunks 2`, `4`, `8` | **C5 — the optimum in $m$** | ~12 min |
+
+R1 is the run your report is built on. **R4 and R5 are what turn a replication into an
+analysis** — they produce curves the original paper does not publish, which is the right
+kind of contribution for a B.Tech project.
+
+Total is well under an hour of GPU compute. Model loading dominates, so loop inside one
+process rather than relaunching per configuration.
+
+### 22.4 Acceptance criteria — what "it worked" looks like
+
+Record R1's table and check it against this. These are the numbers that constitute the
+replication.
+
+**Structural (must hold exactly — these are graph properties, not model properties):**
+
+```
+scheme    vol    lat    n_aggregations
+io        1.0    1.0    0
+cot       2.0    2.0    0
+cot_sc    2.0    2.0    0
+tot       6.0    6.0    0        <- a tree: never aggregates
+got      18.0    7.0    >0   ★   <- the only scheme with in-degree > 1
+```
+
+If `got`'s `n_aggregations` is 0, you have not implemented GoT. If `tot`'s is non-zero,
+your ToT baseline is not a tree and the comparison is invalid.
+
+**Qualitative (the actual replication result):**
+
+```
+err:     got  <  tot  <  cot_sc  ~  cot  <  io       (lower is better)
+bad%:    all schemes < 5%
+```
+
+**What to do if the ordering does not hold:** do not quietly drop the run. Report it. A
+negative result on a 7B model, with `bad%` low so you know the pipeline was sound, is a
+legitimate finding — it says the method's benefit depends on model scale, which connects
+directly to CoT's emergence threshold ([§3.4](#34-results-and-the-emergence-threshold)).
+That is a more interesting paragraph than a confirmation.
+
+### 22.5 Threats to validity — write these down before someone asks
+
+| Threat | Status | Mitigation |
+|---|---|---|
+| Different model from the paper | unavoidable | stated explicitly; claims tested are relative |
+| Our ToT baseline is leaner than theirs | **open** | run their ToT/ToT2 configs ($k$, $L$ varied) for a fair cost comparison |
+| Prompts differ (ours are terser) | deliberate | documented in [§14.6](#146-defensive-parsing); small models need format-strict prompts |
+| Post-merge refinement missing | **open** | official `sorting_032.py` has `Generate(1,10)` after the final aggregate; ours does not |
+| Temperature 1.0 → run-to-run variance | inherent | 100 instances; report variance, not just means |
+| Exact scoring advantages GoT over ToT | inherent to the paper too | note that both schemes use the same scorer here |
+
+The two **open** rows are honest gaps. Naming them yourself is worth more than hoping
+nobody notices.
 
 ---
 

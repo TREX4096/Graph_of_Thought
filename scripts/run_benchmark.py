@@ -84,15 +84,35 @@ from got.tasks.sorting.scoring import sorting_error_scope
 #
 # Adding keyword counting or document merging means adding one entry here plus
 # a tasks/<name>/ package. The Controller, backends and metrics never change.
+# Two CSV schemas are accepted for each task:
+#
+#   ours      (scripts/generate_data.py)  id,length,input,answer
+#   official  (spcl/graph-of-thoughts)    ID,Unsorted,Sorted
+#
+# Supporting the official files matters for the replication: running on the
+# authors' exact inputs removes "different random data" as an explanation for
+# any gap between our numbers and theirs.
+def _pick(row: Dict[str, str], *names: str) -> str:
+    """Return the first present column among ``names`` (case-insensitive)."""
+    lowered = {k.lower(): v for k, v in row.items()}
+    for n in names:
+        if n.lower() in lowered:
+            return lowered[n.lower()]
+    raise KeyError(f"CSV has none of {names}; columns are {list(row)}")
+
+
 def _load_sorting_row(row: Dict[str, str]) -> Dict[str, Any]:
-    return {"numbers": json.loads(row["input"]), "answer": json.loads(row["answer"])}
+    return {
+        "numbers": json.loads(_pick(row, "input", "Unsorted")),
+        "answer": json.loads(_pick(row, "answer", "Sorted")),
+    }
 
 
 def _load_intersection_row(row: Dict[str, str]) -> Dict[str, Any]:
     return {
-        "set_a": json.loads(row["set_a"]),
-        "set_b": json.loads(row["set_b"]),
-        "answer": json.loads(row["answer"]),
+        "set_a": json.loads(_pick(row, "set_a", "SET1")),
+        "set_b": json.loads(_pick(row, "set_b", "SET2")),
+        "answer": json.loads(_pick(row, "answer", "INTERSECTION")),
     }
 
 
@@ -239,6 +259,7 @@ def run_one(
         "total_tokens": lm.usage.total_tokens,
         "n_thoughts": summary.get("n_thoughts", 0),
         "n_aggregations": summary.get("n_aggregations", 0),
+        "invalid_rate": summary.get("invalid_rate", 0.0),
         "max_volume": gm.get("max_volume", 0),
         "max_latency": gm.get("max_latency", 0),
         "wall_seconds": round(wall, 3),
@@ -344,6 +365,7 @@ def main() -> None:
             "mean_max_volume": sum(r["max_volume"] for r in ok) / n,
             "mean_max_latency": sum(r["max_latency"] for r in ok) / n,
             "mean_wall_seconds": sum(r["wall_seconds"] for r in ok) / n,
+            "mean_invalid_rate": sum(r["invalid_rate"] for r in ok) / n,
         }
 
     # --- Persist -----------------------------------------------------
@@ -360,13 +382,42 @@ def main() -> None:
 
     # --- Report ------------------------------------------------------
     print(f"\n{'scheme':8s} {'acc':>7s} {'err':>8s} {'tokens':>10s} "
-          f"{'calls':>7s} {'batch':>7s} {'vol':>6s} {'lat':>6s}")
-    print("-" * 66)
+          f"{'calls':>7s} {'batch':>7s} {'vol':>6s} {'lat':>6s} {'bad%':>6s}")
+    print("-" * 74)
     for scheme, s in summaries.items():
         print(f"{scheme:8s} {s['accuracy']:7.2%} {s['mean_error_scope']:8.2f} "
               f"{s['mean_total_tokens']:10.0f} {s['mean_llm_calls']:7.1f} "
               f"{s['mean_batches']:7.1f} "
-              f"{s['mean_max_volume']:6.1f} {s['mean_max_latency']:6.1f}")
+              f"{s['mean_max_volume']:6.1f} {s['mean_max_latency']:6.1f} "
+              f"{s['mean_invalid_rate']:6.1%}")
+
+    # --- Health check ------------------------------------------------
+    # A run can print a full table of plausible numbers while the pipeline is
+    # broken: if the Parser cannot read the model's output, thoughts arrive
+    # invalid and the multi-step schemes quietly execute fewer operations than
+    # their graph specifies. That produces a *wrong* result that looks like a
+    # weak-model result, so check for it explicitly and say so loudly.
+    EXPECTED_LATENCY = {"io": 1, "cot": 2, "cot_sc": 2, "tot": 6, "got": 7}
+    warnings: List[str] = []
+    for scheme, s in summaries.items():
+        if s["mean_invalid_rate"] > 0.30:
+            warnings.append(
+                f"  {scheme}: {s['mean_invalid_rate']:.0%} of thoughts failed to parse"
+            )
+        want = EXPECTED_LATENCY.get(scheme)
+        if want and s["mean_max_latency"] < want * 0.6:
+            warnings.append(
+                f"  {scheme}: latency {s['mean_max_latency']:.1f} but the graph "
+                f"specifies ~{want} -- operations did not run"
+            )
+    if warnings:
+        print("\n" + "!" * 74)
+        print("PIPELINE WARNING -- these numbers are probably not a model-quality result:")
+        for w in warnings:
+            print(w)
+        print("\nMost likely a prompt/parsing mismatch. Rerun a few instances with")
+        print("--verbose and read the raw completions before trusting this table.")
+        print("!" * 74)
 
     print(f"\nPer-instance CSV : {csv_path}")
     print(f"Summary JSON     : {json_path}")

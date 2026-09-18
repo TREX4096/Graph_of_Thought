@@ -583,14 +583,43 @@ class KeepBest(Operation):
     Emitting *copies* rather than the originals keeps the selection visible
     in the graph, so a reader of the dumped graph can see where pruning
     happened.
+
+    Degrading instead of truncating
+    -------------------------------
+    An earlier version filtered to ``t.valid`` and returned ``[]`` when none
+    survived. Against the mock backend that never fired -- mock output almost
+    always parses -- but against a real 7B model it silently destroyed whole
+    runs: one unparseable batch emptied this operation, every downstream
+    operation then had no input thoughts, and the graph quietly stopped. The
+    summary table showed ToT at 1.1 LLM calls instead of 3 with no error
+    anywhere, which is the worst kind of bug: a wrong number that looks like
+    a result.
+
+    Ranking now prefers valid thoughts but falls back to the best invalid one
+    rather than returning nothing. A badly-scored bad answer is far more
+    informative than a silently truncated graph, and it keeps volume and
+    latency measurable.
     """
+
+    @staticmethod
+    def _rankable(thoughts: List[Thought]) -> List[Thought]:
+        """Valid thoughts if any exist, otherwise everything (see class doc)."""
+        valid = [t for t in thoughts if t.valid]
+        if valid:
+            return valid
+        if thoughts:
+            logging.getLogger(__name__).warning(
+                "no valid thoughts to rank; falling back to %d invalid one(s) "
+                "so the graph keeps its shape", len(thoughts)
+            )
+        return list(thoughts)
 
     def __init__(self, n: int = 1, name: Optional[str] = None) -> None:
         super().__init__(name or f"KeepBest(n={n})")
         self.n = n
 
     def _execute(self, lm, prompter, parser, **kwargs) -> List[Thought]:
-        inputs = [t for t in self.get_input_thoughts() if t.valid]
+        inputs = self._rankable(self.get_input_thoughts())
         if not inputs:
             return []
 
@@ -638,7 +667,11 @@ class KeepBestPerGroup(Operation):
         self.n = n
 
     def _execute(self, lm, prompter, parser, **kwargs) -> List[Thought]:
-        inputs = [t for t in self.get_input_thoughts() if t.valid]
+        # Same fallback as KeepBest: never empty the graph over a bad batch.
+        # Here it matters even more -- emptying one chunk's group would leave
+        # PairwiseAggregate with an odd number of inputs at the next level,
+        # silently changing the merge tree's shape.
+        inputs = KeepBest._rankable(self.get_input_thoughts())
         if not inputs:
             return []
 

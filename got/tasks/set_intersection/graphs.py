@@ -42,8 +42,12 @@ def token_budget(n_elements: int) -> int:
     Set elements here can be multi-digit (the generator draws from a universe
     four times the set size), so we budget more per element than the sorting
     task does. Still far below a 1024-token default, which is the point.
+
+    As with sorting, bias high: generation stops at the stop string, so an
+    unused ceiling costs nothing, whereas truncating the list breaks the
+    parse and drops the thought. See ``sorting.graphs.token_budget``.
     """
-    return max(64, 4 * n_elements + 32)
+    return max(96, 5 * n_elements + 64)
 
 
 STOP = ("\n\n", "\nInput", "Example:")

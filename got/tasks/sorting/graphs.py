@@ -86,8 +86,21 @@ from .scoring import is_correctly_sorted, sorting_score
 # We budget ~2 tokens per element plus generous slack for the brackets and any
 # short preamble a chatty model might emit.
 def token_budget(n_elements: int) -> int:
-    """Generation cap for an answer listing ``n_elements`` digits."""
-    return max(64, 2 * n_elements + 32)
+    """Generation cap for an answer listing ``n_elements`` digits.
+
+    Budget ~3 tokens per element plus 64 of slack. The earlier ``2n + 32``
+    was measured against the ideal encoding (" 5" + "," = 2 tokens) and left
+    no room at all: a 64-element answer needs ~130 tokens of digits, against
+    a 160-token cap, so any preamble at all ("Here is the sorted list:")
+    truncated the answer mid-list. A truncated list has no closing bracket,
+    which made the parse fail, which made the thought invalid, which made
+    KeepBest discard it -- collapsing the graph.
+
+    Over-budgeting is close to free: generation stops at the stop string or
+    EOS, so the cap is a ceiling and not a target. Under-budgeting is
+    catastrophic. Bias high.
+    """
+    return max(96, 3 * n_elements + 64)
 
 
 # Stop strings. The answer is a single line, so anything that starts a new

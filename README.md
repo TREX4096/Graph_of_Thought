@@ -247,9 +247,23 @@ Cost knobs, in order of impact: `--aggregation-attempts` (dominant, it is the
 
 ## Sample data
 
-There are no fixed benchmark files to download — the GoT paper **generates** its
-sorting, set-intersection and keyword-counting data, because the tasks are synthetic by
-construction. `scripts/generate_data.py` does the same, reproducibly:
+The GoT tasks are synthetic — the paper **generates** its sorting, set-intersection and
+keyword-counting data rather than using a public benchmark. But the authors do commit the
+exact CSVs they ran, and those are mirrored here under **`data/official/`**:
+
+```bash
+# The paper's own inputs -- use these for the headline comparison
+python scripts/run_benchmark.py --task sorting \
+    --data data/official/sorting/sorting_064.csv --limit 100 \
+    --backend vllm --model-id Qwen/Qwen2.5-7B-Instruct \
+    --schemes io cot cot_sc tot got --out results/official_64
+```
+
+Their schema (`ID,Unsorted,Sorted`) and ours (`id,length,input,answer`) are both accepted —
+the runner sniffs the columns, so no conversion is needed.
+
+`scripts/generate_data.py` reproduces the same distributions, which is what lets you test
+sizes and overlap ratios the authors never published:
 
 ```bash
 python scripts/generate_data.py --out data --seed 42 --n-samples 100 --small

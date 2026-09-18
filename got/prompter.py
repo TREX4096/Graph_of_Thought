@@ -126,12 +126,32 @@ class AbstractParser(abc.ABC):
         """
         text = cls.strip_code_fences(text)
         matches = re.findall(r"\[[\s\d,\-]*\]", text)
-        if not matches:
-            return None
-        try:
-            return [int(n) for n in re.findall(r"-?\d+", matches[-1])]
-        except ValueError:
-            return None
+        if matches:
+            try:
+                return [int(n) for n in re.findall(r"-?\d+", matches[-1])]
+            except ValueError:
+                return None
+
+        # No closing bracket. The usual cause is the generation hitting
+        # ``max_tokens`` mid-list, and discarding these outright is what made
+        # a whole graph collapse: the thought became invalid, KeepBest dropped
+        # it, and every downstream operation silently had nothing to consume.
+        #
+        # Salvaging the partial list is strictly better. It is a *wrong*
+        # answer, but the error-scope scorer already penalises missing
+        # elements, so it ranks below a complete one exactly as it should --
+        # and the graph keeps its shape, so volume and latency stay
+        # measurable. Losing the last number guards against a half-emitted
+        # digit ("1" of an intended "12").
+        tail = re.search(r"\[[\s\d,\-]*$", text)
+        if tail:
+            nums = re.findall(r"-?\d+", tail.group(0))
+            if len(nums) > 1:
+                try:
+                    return [int(n) for n in nums[:-1]]
+                except ValueError:
+                    return None
+        return None
 
     @classmethod
     def extract_json_object(cls, text: str) -> Optional[Dict[str, Any]]:

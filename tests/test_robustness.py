@@ -1,0 +1,118 @@
+"""
+Regression tests for silent-failure bugs found on the first real-model run.
+===========================================================================
+
+Both bugs here were invisible against the mock backend -- mock output almost
+always parses -- and together they turned a 13-minute GPU run into a table of
+plausible-looking zeros with no error raised anywhere. That is the worst
+failure mode a benchmark can have, so they get dedicated tests.
+
+The chain was:
+
+    max_tokens too tight
+      -> answer truncated mid-list, so no closing "]"
+      -> extract_list returned None, so the thought was invalid
+      -> KeepBest filtered to valid thoughts, found none, returned []
+      -> every downstream operation had no inputs and silently did nothing
+      -> ToT reported 1.1 LLM calls against a graph specifying 3
+
+Each link is tested below.
+"""
+
+from __future__ import annotations
+
+from got.operations import KeepBest, KeepBestPerGroup
+from got.prompter import AbstractParser
+from got.tasks.set_intersection.graphs import token_budget as si_budget
+from got.tasks.sorting.graphs import token_budget as sort_budget
+from got.thought import Thought
+
+
+def _thought(score: float, valid: bool, group: int = 0) -> Thought:
+    t = Thought(state={"current": [1, 2], "chunk_index": group}, valid=valid)
+    t.score = score
+    return t
+
+
+# ----------------------------------------------------------------------
+# Link 1: the parser must salvage a truncated list
+# ----------------------------------------------------------------------
+def test_extract_list_reads_a_complete_list():
+    assert AbstractParser.extract_list("Output: [0, 1, 2, 3]") == [0, 1, 2, 3]
+
+
+def test_extract_list_takes_the_last_list_not_the_first():
+    """Chatty models restate the input before answering."""
+    raw = "Input was [9, 8, 7]. Sorted: [7, 8, 9]"
+    assert AbstractParser.extract_list(raw) == [7, 8, 9]
+
+
+def test_extract_list_salvages_a_truncated_list():
+    """A list cut off by max_tokens has no ']' -- salvage rather than discard."""
+    got = AbstractParser.extract_list("Output: [0, 0, 1, 1, 2, 3, 5, 7, 8")
+    # The final number is dropped: it may be a half-emitted digit.
+    assert got == [0, 0, 1, 1, 2, 3, 5, 7]
+
+
+def test_extract_list_still_rejects_genuine_prose():
+    """Salvaging must not turn 'no answer' into a fake answer."""
+    assert AbstractParser.extract_list("I cannot sort this list.") is None
+    assert AbstractParser.extract_list("") is None
+
+
+# ----------------------------------------------------------------------
+# Link 2: ranking must never empty the graph
+# ----------------------------------------------------------------------
+def test_keepbest_falls_back_when_every_thought_is_invalid():
+    """Returning [] here is what silently truncated whole reasoning graphs."""
+    op = KeepBest(n=1)
+    op.get_input_thoughts = lambda: [
+        _thought(1.0, False), _thought(5.0, False), _thought(3.0, False)
+    ]
+    kept = op._execute(None, None, None)
+    assert len(kept) == 1, "graph must keep its shape even on an all-bad batch"
+    assert kept[0].score == 5.0, "the best of a bad lot is still the best"
+
+
+def test_keepbest_prefers_valid_over_higher_scoring_invalid():
+    op = KeepBest(n=1)
+    op.get_input_thoughts = lambda: [_thought(9.0, False), _thought(2.0, True)]
+    assert op._execute(None, None, None)[0].score == 2.0
+
+
+def test_keepbest_returns_nothing_when_given_nothing():
+    """The fallback must not invent thoughts out of an empty input."""
+    op = KeepBest(n=1)
+    op.get_input_thoughts = lambda: []
+    assert op._execute(None, None, None) == []
+
+
+def test_keepbestpergroup_never_loses_a_chunk():
+    """Dropping a group would change the merge tree's shape at the next level."""
+    op = KeepBestPerGroup(group_key="chunk_index", n=1)
+    op.get_input_thoughts = lambda: [
+        _thought(1.0, False, 0), _thought(4.0, False, 0),
+        _thought(2.0, False, 1), _thought(7.0, False, 1),
+    ]
+    kept = op._execute(None, None, None)
+    assert len(kept) == 2, "one survivor per chunk, valid or not"
+    assert {t.score for t in kept} == {4.0, 7.0}
+
+
+# ----------------------------------------------------------------------
+# Link 3: the budget must fit the answer it is asking for
+# ----------------------------------------------------------------------
+def test_token_budget_fits_a_full_length_answer():
+    """~2 tokens per element is the floor; the cap must clear it with slack.
+
+    The original 2n+32 gave 160 tokens for a 64-element answer needing ~130,
+    leaving no room for a preamble -- so any chatty model truncated.
+    """
+    for n in (16, 32, 64, 128):
+        minimum = 2 * n          # digits and separators, ideal encoding
+        assert sort_budget(n) > minimum * 1.25, f"sorting budget too tight at n={n}"
+        assert si_budget(n) > minimum * 1.25, f"intersection budget too tight at n={n}"
+
+
+def test_token_budget_grows_with_input():
+    assert sort_budget(128) > sort_budget(64) > sort_budget(32)
