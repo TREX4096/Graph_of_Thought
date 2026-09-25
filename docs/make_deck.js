@@ -650,7 +650,7 @@ function tbl(s, header, rows, x, y, w, colW, hi, rowH, fs) {
   sub(s, "Transferring chain compression to a reasoning graph", 0.75, 1.3, 11.0);
 
   tbl(s, ["Chain technique", "Graph analogue we propose", "Expected effect"], [
-    ["Chain of Draft", "Encode each vertex compactly - a sorted chunk as run-length pairs rather than a literal list", "Lossless here; ~6x fewer tokens per vertex"],
+    ["Chain of Draft", "Encode each vertex compactly - a sorted chunk as run-length pairs rather than a literal list", "Lossless here; 3.8x fewer tokens per vertex (measured)"],
     ["TokenSkip", "Ablate each vertex; drop those whose removal does not change the answer", "Reduces |V| directly"],
     ["Coconut", "Aggregate in latent space - merge hidden states without decoding to text", "Removes decode cost at the 15 merge steps"],
     ["Token budgeting", "Allocate k per vertex by measured difficulty rather than uniformly", "Spend where errors concentrate"],
@@ -684,7 +684,7 @@ function tbl(s, header, rows, x, y, w, colW, hi, rowH, fs) {
     { x: 1.0, y: 6.24, w: 11.4, h: 0.44, isTextBox: true, fontFace: F,
       fontSize: 10.5, bold: true, color: TEAL, margin: 0 });
 
-  s.addNotes("The run-length idea is worth dwelling on. For sorting, a chunk of sixty-four digits drawn from ten values compresses losslessly to roughly twenty tokens instead of a hundred and thirty. That is chain-of-draft applied to a graph vertex, and it costs nothing in accuracy because the encoding is exact.");
+  s.addNotes("The run-length figure is measured with Qwen2.5's own tokenizer, not estimated. A 64-element list costs exactly 192 tokens - three per element, being the digit, the comma and the space. Run-length encoded it costs 50. That is 3.8x, losslessly, because the encoding is exact. It is chain-of-draft applied to a graph vertex.");
 }
 
 // =====================================================================
