@@ -116,3 +116,55 @@ def test_token_budget_fits_a_full_length_answer():
 
 def test_token_budget_grows_with_input():
     assert sort_budget(128) > sort_budget(64) > sort_budget(32)
+
+
+# ----------------------------------------------------------------------
+# The final corrective pass (reference repo: Generate(1,10) after the
+# last aggregation). Its value depends entirely on being monotone.
+# ----------------------------------------------------------------------
+def test_refinement_pass_adds_the_expected_operations():
+    from got.tasks.sorting.graphs import got_sorting_goo
+
+    def names(leaves):
+        seen, stack = [], list(leaves)
+        while stack:
+            op = stack.pop()
+            if op.name in seen:
+                continue
+            seen.append(op.name)
+            stack.extend(op.predecessors)
+        return seen
+
+    with_refine = names(got_sorting_goo(list(range(32)), refine_attempts=10))
+    without = names(got_sorting_goo(list(range(32)), refine_attempts=0))
+
+    assert any("Refine" in n for n in with_refine)
+    assert not any("Refine" in n for n in without), "0 must disable the pass"
+    assert len(with_refine) == len(without) + 3, "Improve + Score + KeepBest"
+
+
+def test_refinement_scores_the_incumbent_alongside_candidates():
+    """Monotonicity depends on this wiring, so assert it directly.
+
+    If ScoreRefine has only the Improve operation as a predecessor, KeepBest
+    ranks the candidates alone and a bad refinement round can return an answer
+    *worse* than the merged result it started from.
+    """
+    from got.tasks.sorting.graphs import got_sorting_goo
+
+    leaves = got_sorting_goo(list(range(32)), refine_attempts=10)
+    stack, score_refine = list(leaves), None
+    while stack:
+        op = stack.pop()
+        if op.name == "ScoreRefine":
+            score_refine = op
+            break
+        stack.extend(op.predecessors)
+
+    assert score_refine is not None, "ScoreRefine should be in the graph"
+    assert len(score_refine.predecessors) == 2, (
+        "ScoreRefine needs both the refinement candidates and the incumbent"
+    )
+    pred_names = {p.name for p in score_refine.predecessors}
+    assert any("Refine" in n for n in pred_names)
+    assert any("KeepBestMerge" in n for n in pred_names), "incumbent must compete"

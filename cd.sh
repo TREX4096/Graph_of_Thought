@@ -1,6 +1,8 @@
 
 ssh subhanu@10.208.67.120
 
+psswd: subhanu_server@123
+
 cd /home/subhanu/GOT_Compression/IITD_GOT/Prasoon/
 
 git clone https://github.com/TREX4096/Graph_of_Thought

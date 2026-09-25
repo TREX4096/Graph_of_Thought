@@ -118,6 +118,7 @@ def got_sorting_goo(
     num_chunks: int = 4,
     branching_factor: int = 3,
     aggregation_attempts: int = 10,
+    refine_attempts: int = 10,
     use_llm_scoring: bool = False,
 ) -> List[Operation]:
     """Build the GoT Graph of Operations for sorting.
@@ -135,6 +136,17 @@ def got_sorting_goo(
         ``k`` for each merge (paper: 10). This is the **single largest cost
         knob** in the graph -- every merge level generates this many full-length
         candidate lists. Halving it roughly halves total decode tokens.
+    refine_attempts:
+        Candidate refinements drawn in the final corrective pass, matching the
+        reference implementation's ``Generate(1, 10)`` after its last
+        aggregation. Pass 0 to disable the pass entirely (the graph shape we
+        had before this was added, useful as an ablation).
+
+        This is where a corrective pass pays for itself: the final merge is
+        the only step that must get the *global* multiset right, so it is
+        where errors concentrate. Drawing ``refine_attempts`` fixes and keeping
+        the best-scoring one cannot make the answer worse, because the scorer
+        is exact and the incumbent is one of the things being ranked.
     use_llm_scoring:
         If False (default, and what the paper does for sorting) use the exact
         local scorer -- free, exact, and far cheaper than querying the model.
@@ -211,6 +223,47 @@ def got_sorting_goo(
             keep = KeepBest(n=1, name=f"KeepBestMerge_L{depth}")
         keep.add_predecessor(sc_m)
         level = keep
+
+    # --- Final corrective pass ---------------------------------------
+    # Reference implementation, examples/sorting/sorting_032.py:
+    #
+    #     operations_graph.append_operation(operations.Generate(1, 10))
+    #     operations_graph.append_operation(operations.Score(...))
+    #     operations_graph.append_operation(operations.KeepBestN(1, False))
+    #
+    # i.e. after the last aggregation, draw 10 repair attempts on the merged
+    # result, score them, keep the best.
+    #
+    # One deliberate difference from the reference: we feed the *incumbent*
+    # into the same Score as the candidates, so KeepBest ranks all
+    # refine_attempts + 1 together. The reference ranks only the candidates,
+    # which means a bad refinement round can return an answer worse than the
+    # one it started from -- precisely the failure visible in our CoT and ToT
+    # baselines, where a single blind rewrite roughly doubled the error
+    # scope. Including the incumbent makes the pass monotone under an exact
+    # scorer: the output is never worse than the input.
+    #
+    # Note this is itself a fan-in (Score has two predecessors), which is
+    # only expressible because the GoO is a graph -- the same structural
+    # freedom the paper is about.
+    if refine_attempts > 0:
+        imp = Improve(
+            prompt_name="improve",
+            rounds=1,
+            attempts=refine_attempts,
+            name=f"Refine(k={refine_attempts})",
+            max_tokens=token_budget(n),
+            stop=SORT_STOP,
+        )
+        imp.add_predecessor(level)
+
+        sc_r = Score(scoring_fn=scorer, name="ScoreRefine")
+        sc_r.add_predecessor(imp)
+        sc_r.add_predecessor(level)      # <-- incumbent competes too
+
+        keep_r = KeepBest(n=1, name="KeepBestRefine")
+        keep_r.add_predecessor(sc_r)
+        level = keep_r
 
     # --- Terminal evaluation -----------------------------------------
     # Compare against the true global input, not the local merge input.

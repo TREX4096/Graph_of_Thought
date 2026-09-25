@@ -59,6 +59,7 @@ def got_intersection_goo(
     num_chunks: int = 4,
     branching_factor: int = 3,
     aggregation_attempts: int = 5,
+    refine_attempts: int = 10,
 ) -> List[Operation]:
     """Build the GoT Graph of Operations for set intersection.
 
@@ -124,6 +125,28 @@ def got_intersection_goo(
         )
         keep.add_predecessor(sc_u)
         level = keep
+
+    # Final corrective pass, mirroring the sorting graph. The incumbent is
+    # scored alongside the candidates so the pass cannot make things worse --
+    # see got.tasks.sorting.graphs for the full rationale.
+    if refine_attempts > 0:
+        imp = Improve(
+            prompt_name="improve",
+            rounds=1,
+            attempts=refine_attempts,
+            name=f"Refine(k={refine_attempts})",
+            max_tokens=token_budget(len(set_a)),
+            stop=STOP,
+        )
+        imp.add_predecessor(level)
+
+        sc_r = Score(scoring_fn=intersection_score, name="ScoreRefine")
+        sc_r.add_predecessor(imp)
+        sc_r.add_predecessor(level)
+
+        keep_r = KeepBest(n=1, name="KeepBestRefine")
+        keep_r.add_predecessor(sc_r)
+        level = keep_r
 
     gt = GroundTruth(check_fn=is_correct_intersection, name="GroundTruth")
     gt.add_predecessor(level)

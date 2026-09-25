@@ -177,6 +177,33 @@ TASK=set_intersection LENGTH=32 bash scripts/run_direct.sh --bg   # paper §5.2
 MODEL_ID=Qwen/Qwen2.5-7B-Instruct AGG_K=5 bash scripts/run_direct.sh --bg
 ```
 
+### The whole replication in one command (tmux)
+
+`run_tmux.sh` runs the full **R0–R5** matrix — headline run, difficulty sweep, second
+task, cost/quality curve, chunk-count optimum, refinement ablation — inside a tmux
+session that survives SSH drops:
+
+```bash
+bash scripts/run_tmux.sh            # start everything
+tmux attach -t got                  # watch
+#   Ctrl-b then d                   # detach; the job keeps running
+tmux kill-session -t got            # stop
+```
+
+It finishes by running the paper comparison automatically. Single runs too:
+`bash scripts/run_tmux.sh R1`.
+
+### Scoring your results against the paper
+
+```bash
+python scripts/compare_to_paper.py --results results/matrix_20260925_120000
+python scripts/compare_to_paper.py --results results/R1 --markdown > report_table.md
+```
+
+Prints a verdict per claim in three groups: **pipeline health** (nothing else counts if
+this fails), **structural** (model-independent — a FAIL is a bug), and **empirical**
+(model-dependent — a FAIL is a finding).
+
 ### SLURM cluster
 
 ```bash
@@ -309,6 +336,8 @@ in under a second and exercises the whole pipeline.
 ├── scripts/
 │   ├── generate_data.py        build the datasets
 │   ├── run_direct.sh           run on a plain GPU server (no scheduler, no root)
+│   ├── run_tmux.sh             full R0-R5 matrix in tmux; survives SSH drops
+│   ├── compare_to_paper.py     score measured results against the paper's claims
 │   ├── run_benchmark.py        main experiment runner
 │   ├── visualize_graph.py      draw reasoning graphs + latency/volume plot
 │   ├── download_local_model.sh fetch a small GGUF model
@@ -392,6 +421,8 @@ full honest accounting.
 | Datasets (all 4 tasks) | ✅ generated |
 | Visualisation | ✅ complete |
 | Plain-GPU-server runner (`run_direct.sh`) | ✅ complete — no scheduler or root needed |
+| tmux matrix runner + paper comparison | ✅ complete |
+| Final corrective pass (reference repo parity) | ✅ complete, and made monotone |
 | HPC / SLURM scripts | ✅ written — **needs cluster-specific edits** |
 | Keyword counting GoO | ⬜ data + mock ready, builder not written |
 | Document merging GoO | ⬜ data ready, needs LLM-based scoring |

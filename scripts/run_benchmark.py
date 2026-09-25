@@ -127,7 +127,8 @@ def _build_sorting(scheme: str, builder, inst: Dict[str, Any], args) -> Any:
     if scheme == "got":
         return builder(numbers, num_chunks=args.num_chunks,
                        branching_factor=args.branching_factor,
-                       aggregation_attempts=args.aggregation_attempts)
+                       aggregation_attempts=args.aggregation_attempts,
+                       refine_attempts=args.refine_attempts)
     if scheme == "tot":
         return builder(numbers, branching_factor=args.branching_factor,
                        depth=args.tot_depth)
@@ -142,7 +143,8 @@ def _build_intersection(scheme: str, builder, inst: Dict[str, Any], args) -> Any
     if scheme == "got":
         return builder(a, b, num_chunks=args.num_chunks,
                        branching_factor=args.branching_factor,
-                       aggregation_attempts=args.aggregation_attempts)
+                       aggregation_attempts=args.aggregation_attempts,
+                       refine_attempts=args.refine_attempts)
     if scheme == "tot":
         return builder(a, b, branching_factor=args.branching_factor,
                        depth=args.tot_depth)
@@ -302,6 +304,10 @@ def main() -> None:
     ap.add_argument("--num-chunks", type=int, default=4)
     ap.add_argument("--branching-factor", type=int, default=3)
     ap.add_argument("--aggregation-attempts", type=int, default=10)
+    # Final corrective pass after the last merge (reference repo uses 10).
+    # 0 disables it, which is the ablation for "does refinement help?".
+    ap.add_argument("--refine-attempts", type=int, default=10,
+                    help="GoT: candidate repairs after the final merge; 0 = off")
     ap.add_argument("--tot-depth", type=int, default=3)
 
     ap.add_argument("--seed", type=int, default=42)

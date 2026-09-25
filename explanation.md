@@ -3138,14 +3138,27 @@ Four differences from ours, and one of them is a genuine gap:
 | chunks | 2, via `Selector` on `state["part"]` | 4, via `KeepBestPerGroup` on `chunk_index` | equivalent; ours is batched, so cheaper on a GPU |
 | $k$ per chunk | 5 | 3 (Figure 4's value for 64) | both defensible; ours is the figure's number |
 | $k_a$ | 10 | 10 | same |
-| **post-merge refinement** | **`Generate(1,10)` + Score + KeepBest after the final aggregate** | **absent** | **a real gap — see below** |
+| **post-merge refinement** | `Generate(1,10)` + Score + KeepBest after the final aggregate | `Improve(attempts=10)` + Score + KeepBest, **with the incumbent also scored** | implemented, and made monotone |
 
-**The refinement pass is worth adding.** After the last merge, they generate 10 further
-*improvement* attempts on the merged result, score them, and keep the best. Our graph stops
-at the final `KeepBest`. Since merging is where errors concentrate, a corrective pass
-immediately after it is exactly where an improvement round pays for itself. Adding it means
-appending one `Improve` (or `Generate`) + `Score` + `KeepBest(1)` before `GroundTruth` in
-[`got_sorting_goo()`](got/tasks/sorting/graphs.py#L103) — roughly four lines.
+**The refinement pass — implemented, with one improvement.** After the last merge, the
+reference generates 10 further *improvement* attempts on the merged result, scores them,
+and keeps the best. Since merging is where errors concentrate, this is exactly where a
+corrective pass pays for itself. It is now in `got_sorting_goo()` and
+`got_intersection_goo()`, controlled by `--refine-attempts` (default 10; `0` disables it,
+which is the ablation).
+
+One deliberate difference: **we feed the incumbent into the same `Score` as the
+candidates**, so `KeepBest` ranks all $k+1$ together. The reference ranks only the
+candidates, which means a bad refinement round can return an answer *worse* than the one
+it started from — precisely the failure visible in our CoT and ToT baselines, where a
+single blind rewrite roughly doubled the error scope. Including the incumbent makes the
+pass **monotone** under an exact scorer: the output is never worse than the input.
+
+Note that this is itself a fan-in — `Score` with two predecessors — and so is only
+expressible because the GoO is a graph. The same structural freedom the paper is about.
+
+Measured on the mock backend at 64 elements: error-scope **5.45 → 3.40 (−38%)** for +40%
+tokens and one extra level of latency.
 
 Their `Selector` is also a useful primitive we implement but barely use
 ([`Selector`](got/operations.py#L678)): it filters the thought list by an arbitrary
@@ -3252,6 +3265,27 @@ kind of contribution for a B.Tech project.
 Total is well under an hour of GPU compute. Model loading dominates, so loop inside one
 process rather than relaunching per configuration.
 
+### 22.3b Scoring the results automatically
+
+Checking six runs by hand against five claims is error-prone and easy to rationalise
+after the fact, so the criteria are fixed in code *before* the results arrive:
+
+```bash
+python scripts/compare_to_paper.py --results results/matrix_20260925_120000
+python scripts/compare_to_paper.py --results results/R1 --markdown > report_table.md
+```
+
+It reads every `*_summary.json` under the directory and prints a verdict per claim, split
+into three groups in the order you should read them:
+
+1. **PIPELINE HEALTH** — parse failure rates. *Nothing below counts if this fails.*
+2. **STRUCTURAL** — volume, latency, and which schemes aggregate. Model-independent, so a
+   `FAIL` here is a **bug**.
+3. **EMPIRICAL** — the quality ordering and the GoT-vs-ToT margin. Model-dependent, so a
+   `FAIL` here is a **finding**.
+
+`--markdown` emits tables you can paste straight into the report.
+
 ### 22.4 Acceptance criteria — what "it worked" looks like
 
 Record R1's table and check it against this. These are the numbers that constitute the
@@ -3291,7 +3325,7 @@ That is a more interesting paragraph than a confirmation.
 | Different model from the paper | unavoidable | stated explicitly; claims tested are relative |
 | Our ToT baseline is leaner than theirs | **open** | run their ToT/ToT2 configs ($k$, $L$ varied) for a fair cost comparison |
 | Prompts differ (ours are terser) | deliberate | documented in [§14.6](#146-defensive-parsing); small models need format-strict prompts |
-| Post-merge refinement missing | **open** | official `sorting_032.py` has `Generate(1,10)` after the final aggregate; ours does not |
+| ~~Post-merge refinement missing~~ | **closed** | added as `--refine-attempts` (default 10), with the incumbent scored alongside the candidates so the pass is monotone |
 | Temperature 1.0 → run-to-run variance | inherent | 100 instances; report variance, not just means |
 | Exact scoring advantages GoT over ToT | inherent to the paper too | note that both schemes use the same scorer here |
 

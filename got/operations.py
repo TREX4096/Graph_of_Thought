@@ -429,19 +429,36 @@ class Improve(Operation):
     ----------
     rounds:
         How many successive refinement passes to apply.
+    attempts:
+        How many candidate refinements to draw per thought per round. The
+        default of 1 is a plain rewrite. Values > 1 make this a *best-of-k*
+        refinement, which is what the reference implementation does after its
+        final aggregation (``Generate(1, 10)`` in
+        ``examples/sorting/sorting_032.py``) and is a meaningfully different
+        operation: one rewrite is a coin flip that can easily make the answer
+        worse, whereas k rewrites followed by ``Score`` + ``KeepBest`` can
+        only improve it when the scorer is exact (see explanation.md Sec 8.1).
+
+        Candidates fan out, so with ``attempts=k`` and ``rounds=r`` an input
+        thought yields ``k**r`` thoughts. Put a ``KeepBest`` between rounds if
+        you want both above 1; the GoT graphs use ``rounds=1``.
     """
 
     def __init__(
         self,
         prompt_name: str = "improve",
         rounds: int = 1,
+        attempts: int = 1,
         name: Optional[str] = None,
         max_tokens: Optional[int] = None,
         stop: Optional[Sequence[str]] = None,
     ) -> None:
-        super().__init__(name or f"Improve({prompt_name},r={rounds})")
+        label = f"Improve({prompt_name},r={rounds}"
+        label += f",k={attempts})" if attempts > 1 else ")"
+        super().__init__(name or label)
         self.prompt_name = prompt_name
         self.rounds = rounds
+        self.attempts = max(1, attempts)
         self.max_tokens = max_tokens
         self.stop = stop
 
@@ -466,7 +483,7 @@ class Improve(Operation):
 
             batched = lm.query_batch(
                 prompts,
-                num_responses=1,
+                num_responses=self.attempts,
                 max_tokens=self.max_tokens,
                 stop=self.stop,
             )
@@ -475,12 +492,18 @@ class Improve(Operation):
             replaced = {id(t) for t in targets}
             for node, responses in zip(targets, batched):
                 if not responses:
+                    # Nothing came back: keep the original rather than
+                    # dropping it, so the graph does not lose a branch.
                     refreshed.append(node)
                     continue
-                st = parser.parse(
-                    self.prompt_name, [node.state], responses[0], **kwargs
-                )
-                refreshed.append(self._new_thought(st, self.prompt_name, [node]))
+                # With attempts > 1 every candidate becomes its own thought,
+                # all sharing the same parent. A following Score + KeepBest
+                # collapses them back to one.
+                for raw in responses[: self.attempts]:
+                    st = parser.parse(
+                        self.prompt_name, [node.state], raw, **kwargs
+                    )
+                    refreshed.append(self._new_thought(st, self.prompt_name, [node]))
 
             # Carry through any thought that had no prompt this round.
             current = refreshed + [t for t in current if id(t) not in replaced]
