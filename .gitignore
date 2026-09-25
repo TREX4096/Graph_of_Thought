@@ -21,3 +21,6 @@ id_rsa*
 id_ed25519*
 *.pem
 *.key
+
+# transient git bundles used to ship commits over SSH when the proxy is down
+*.bundle
