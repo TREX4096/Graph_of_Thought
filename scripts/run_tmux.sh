@@ -86,9 +86,37 @@ if [ -t 0 ]; then
     stty -echo 2>/dev/null || true
 fi
 
-source "\$(dirname \$(dirname \$(command -v conda)))/etc/profile.d/conda.sh"
-conda activate ${ENV_NAME}
+# ---------------------------------------------------------------------
+# Locate conda WITHOUT relying on PATH.
+# ---------------------------------------------------------------------
+# tmux inherits the environment of whatever launched it. Started over a
+# non-interactive SSH command, that environment has never sourced ~/.bashrc,
+# so \`command -v conda\` finds nothing and the old one-liner expanded to
+# "source /etc/profile.d/conda.sh" -- silently wrong, and the whole matrix
+# then died on "python: command not found".
+CONDA_SH=""
+for _b in "\${CONDA_BASE:-}" "\$HOME/Time_series_Diffusion" "\$HOME/miniconda3" \\
+          "\$HOME/anaconda3" "\$HOME/miniforge3" /opt/conda; do
+    [ -n "\$_b" ] && [ -f "\$_b/etc/profile.d/conda.sh" ] && { CONDA_SH="\$_b/etc/profile.d/conda.sh"; break; }
+done
+if [ -z "\$CONDA_SH" ] && command -v conda >/dev/null 2>&1; then
+    _c="\$(dirname "\$(dirname "\$(command -v conda)")")/etc/profile.d/conda.sh"
+    [ -f "\$_c" ] && CONDA_SH="\$_c"
+fi
+if [ -z "\$CONDA_SH" ]; then
+    _c="\$(find "\$HOME" -maxdepth 4 -path '*/etc/profile.d/conda.sh' 2>/dev/null | head -1)"
+    [ -n "\$_c" ] && CONDA_SH="\$_c"
+fi
+[ -n "\$CONDA_SH" ] || { echo "FATAL: conda.sh not found; set CONDA_BASE" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "\$CONDA_SH"
+conda activate ${ENV_NAME} || { echo "FATAL: cannot activate ${ENV_NAME}" >&2; exit 1; }
+command -v python >/dev/null || { echo "FATAL: no python after activate" >&2; exit 1; }
+python -c "import got" 2>/dev/null || { echo "FATAL: 'got' not installed -- run: pip install -e ." >&2; exit 1; }
+
 cd "${PROJECT_ROOT}"
+echo "conda  : \$CONDA_SH"
+echo "python : \$(command -v python)"
 
 cat <<'BANNER'
 +------------------------------------------------------------------+
