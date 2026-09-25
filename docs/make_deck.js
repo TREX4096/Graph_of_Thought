@@ -1,5 +1,5 @@
 // Causality-Preserving Graph Coarsening for Efficient LLM Reasoning
-// BTP deck -- 12 slides, ~12 minutes.
+// BTP deck -- 14 slides, ~14 minutes.
 //
 // Visual motif: nodes and edges. The whole project is about changing the
 // shape of a reasoning graph, so every structural claim is drawn as one.
@@ -24,8 +24,14 @@ const MUTE   = "6E6A85";
 const PAPER  = "F6F4FD";
 const DIM    = "A79FCB";
 
-const HEAD = "Cambria";
-const BODY = "Calibri";
+// Montserrat, as requested. It is NOT bundled with Office, so it must be
+// installed on the presenting machine (free: fonts.google.com/specimen/Montserrat)
+// or embedded via File > Options > Save > Embed fonts. Otherwise PowerPoint
+// substitutes a metric-incompatible face and text reflows.
+// Montserrat sets ~8-10% wider than Calibri at the same point size, so body
+// sizes below carry deliberate slack.
+const HEAD = "Montserrat";
+const BODY = "Montserrat";
 
 pres.author = "Prasoon Raj, Nikhil Bansal";
 pres.title  = "Causality-Preserving Graph Coarsening for Efficient LLM Reasoning";
@@ -296,6 +302,69 @@ function stat(s, x, y, w, big, label, color, bg) {
 }
 
 // =====================================================================
+// 4b. How the graph builds its vertices and edges  (paper Sec 3.2, 4.5)
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  title(s, "How vertices and edges are constructed", "Besta et al., Sections 3.2 and 4.5 - the rule set any coarsening must respect");
+
+  card(s, 0.75, 1.78, 5.5, 2.15, NIGHT, true);
+  s.addText("The engine builds the state graph with one loop", { x: 1.0, y: 1.93, w: 5.0, h: 0.28,
+    isTextBox: true, fontFace: BODY, fontSize: 12, bold: true, color: AMBER, margin: 0 });
+  s.addText("for op in TOPOLOGICAL-ORDER(GoO):\n    parents <- thoughts of op.predecessors\n    for t in op.EXECUTE(parents):\n        V <- V + {t}\n        for p in t.parents:\n            E <- E + {(p, t)}",
+    { x: 1.0, y: 2.28, w: 5.0, h: 1.45, isTextBox: true, fontFace: "Courier New",
+      fontSize: 10.5, color: WHITE, margin: 0 });
+
+  s.addText("Topological order is required, not stylistic: with aggregation the plan is a DAG, so running operations in the order written is not sufficient.",
+    { x: 0.75, y: 4.02, w: 5.5, h: 0.62, isTextBox: true, fontFace: BODY,
+      fontSize: 11, italic: true, color: MUTE, margin: 0 });
+
+  const tb = [["Operation", "Vertices created", "Edges created"].map(t =>
+    ({ text: t, options: { bold: true, color: WHITE, fill: { color: VIOLET } } }))];
+  [["Generate (k)", "k per input", "input -> each new"],
+   ["Aggregate (k)", "k, from all inputs", "EVERY input -> each new"],
+   ["Improve", "1 per input", "input -> new"],
+   ["Score", "none", "none"],
+   ["KeepBest (n)", "none", "none"],
+   ["GroundTruth", "none", "none"]].forEach((r, i) => {
+    const hl = i === 1, zero = i >= 3;
+    tb.push(r.map((c, j) => ({ text: c, options: { bold: hl || j === 0,
+      color: hl ? AMBER : (zero ? MUTE : INK),
+      fill: { color: hl ? "FFF6E6" : (i % 2 ? WHITE : PAPER) } } })));
+  });
+  s.addTable(tb, { x: 6.6, y: 1.78, w: 6.0, colW: [1.85, 1.9, 2.25], rowH: 0.38,
+    fontFace: BODY, fontSize: 11, border: { type: "solid", color: "E2DCF6", pt: 1 },
+    valign: "middle" });
+
+  s.addText("Only Generate, Aggregate and Improve create vertices - exactly the paper's three thought transformations. Score and KeepBest annotate and filter.",
+    { x: 6.6, y: 4.48, w: 6.0, h: 0.6, isTextBox: true, fontFace: BODY,
+      fontSize: 11, italic: true, color: MUTE, margin: 0 });
+
+  card(s, 0.75, 4.85, 5.5, 1.8, "FFF6E6");
+  s.addText("The defining rule", { x: 1.0, y: 5.0, w: 3.0, h: 0.28, isTextBox: true,
+    fontFace: BODY, fontSize: 12, bold: true, color: AMBER, margin: 0 });
+  const d2 = 0.17, ay = 5.45;
+  [-0.75, -0.25, 0.25, 0.75].forEach(o => {
+    edge(s, 2.6 + o + d2 / 2, ay + d2 / 2, 2.6 + d2 / 2, ay + 0.72 + d2 / 2, AMBER, 1.8);
+    node(s, 2.6 + o, ay, d2, VIOLET);
+  });
+  node(s, 2.6, ay + 0.72, d2 + 0.03, AMBER);
+  s.addText("in-degree = 4 > 1\nso the graph is not a tree", { x: 3.55, y: 5.5, w: 2.55, h: 0.62,
+    isTextBox: true, fontFace: BODY, fontSize: 11, bold: true, color: INK, margin: 0 });
+
+  card(s, 6.6, 5.2, 6.0, 1.45, PANEL, true);
+  s.addText("An edge (a, b) means a's text was literally the input that produced b.",
+    { x: 6.85, y: 5.36, w: 5.5, h: 0.32, isTextBox: true, fontFace: BODY,
+      fontSize: 12.5, bold: true, color: WHITE, margin: 0 });
+  s.addText("Edges encode causality, not similarity - which is why a coarsening operator cannot simply merge similar vertices. It must preserve which thoughts can still reach the answer.",
+    { x: 6.85, y: 5.73, w: 5.5, h: 0.82, isTextBox: true, fontFace: BODY,
+      fontSize: 11, color: DIM, margin: 0 });
+
+  s.addNotes("Worked example on 32 numbers: the first merge level creates 20 vertices but 40 edges, because every merge draws an edge from both of its inputs. That doubling is the fan-in, and it is the only point in the trace where edges outnumber vertices. It is also exactly what a coarsening step has to account for.");
+}
+
+// =====================================================================
 // 5. Use case
 // =====================================================================
 {
@@ -486,15 +555,15 @@ function stat(s, x, y, w, big, label, color, bg) {
 {
   const s = pres.addSlide();
   s.background = { color: WHITE };
-  title(s, "Result 2: quality on a 7B open model", "100 instances, 64-element sorting, the authors' dataset, zero parse failures");
+  title(s, "Result 2: quality does not reproduce at 7B", "100 instances, 64-element sorting, the authors' dataset, zero parse failures");
 
   s.addChart(pres.ChartType.bar, [{
     name: "Error scope",
     labels: ["IO", "CoT", "CoT-SC", "ToT", "GoT"],
-    values: [9.83, 10.34, 8.17, 9.87, 8.11],
+    values: [9.83, 10.34, 8.17, 7.45, 8.28],
   }], {
     x: 0.75, y: 1.85, w: 6.6, h: 3.5, barDir: "col",
-    chartColors: [VIOLET, VIOLET, VIOLET, VIOLET, AMBER],
+    chartColors: [VIOLET, VIOLET, VIOLET, MINT, AMBER],
     showTitle: true, title: "Mean error scope (lower is better)",
     titleFontFace: BODY, titleFontSize: 13, titleColor: INK,
     showValue: true, dataLabelPosition: "outEnd", dataLabelFontSize: 11,
@@ -505,32 +574,32 @@ function stat(s, x, y, w, big, label, color, bg) {
     chartArea: { fill: { color: WHITE } },
   });
 
-  card(s, 7.7, 1.85, 4.9, 1.5, "FFF6E6");
-  s.addText("GoT ranks best", { x: 7.95, y: 2.02, w: 4.4, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 13.5, bold: true, color: AMBER, margin: 0 });
-  s.addText("Lowest error of all five schemes, with a 0% parse-failure rate - so the pipeline is sound and the ordering is meaningful.",
-    { x: 7.95, y: 2.35, w: 4.4, h: 0.9, isTextBox: true, fontFace: BODY,
+  card(s, 7.7, 1.85, 4.9, 1.42, "EAFBF3");
+  s.addText("Structure does help", { x: 7.95, y: 2.0, w: 4.4, h: 0.3, isTextBox: true,
+    fontFace: BODY, fontSize: 13.5, bold: true, color: MINT, margin: 0 });
+  s.addText("GoT improves on direct prompting by 15.8%, and every structural claim reproduces exactly.",
+    { x: 7.95, y: 2.33, w: 4.4, h: 0.85, isTextBox: true, fontFace: BODY,
       fontSize: 11.5, color: INK, margin: 0 });
 
-  card(s, 7.7, 3.5, 4.9, 1.35, WHITE);
-  s.addText("No exact solutions yet", { x: 7.95, y: 3.67, w: 4.4, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 13.5, bold: true, color: VIOLET, margin: 0 });
-  s.addText("0% fully correct at 64 elements. Expected: reliable chain-of-thought is emergent above roughly 10B parameters.",
-    { x: 7.95, y: 4.0, w: 4.4, h: 0.75, isTextBox: true, fontFace: BODY,
+  card(s, 7.7, 3.42, 4.9, 1.5, "FFEEF1");
+  s.addText("But ToT wins here", { x: 7.95, y: 3.57, w: 4.4, h: 0.3, isTextBox: true,
+    fontFace: BODY, fontSize: 13.5, bold: true, color: ROSE, margin: 0 });
+  s.addText("ToT scores 11.1% lower error than GoT while using 3.6x fewer tokens. The paper's quality claim does not hold in this regime.",
+    { x: 7.95, y: 3.9, w: 4.4, h: 0.95, isTextBox: true, fontFace: BODY,
       fontSize: 11.5, color: INK, margin: 0 });
 
-  card(s, 7.7, 5.0, 4.9, 1.6, PANEL, true);
-  s.addText("And the reason this project exists", { x: 7.95, y: 5.15, w: 4.4, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 13, bold: true, color: AMBER, margin: 0 });
-  s.addText("GoT consumes 7,899 tokens per instance against 520 for direct prompting - a 15x cost for the best quality.",
-    { x: 7.95, y: 5.48, w: 4.4, h: 0.95, isTextBox: true, fontFace: BODY,
-      fontSize: 11.5, color: WHITE, margin: 0 });
+  card(s, 7.7, 5.07, 4.9, 1.55, PANEL, true);
+  s.addText("Two likely reasons", { x: 7.95, y: 5.22, w: 4.4, h: 0.3, isTextBox: true,
+    fontFace: BODY, fontSize: 13, bold: true, color: AMBER, margin: 0 });
+  s.addText("An exact scorer makes ToT's monotone refinement very strong; and at 7B each of GoT's 15 merge steps is an opportunity to fail.",
+    { x: 7.95, y: 5.55, w: 4.4, h: 0.95, isTextBox: true, fontFace: BODY,
+      fontSize: 11, color: WHITE, margin: 0 });
 
-  s.addText("Reference point: the paper reports +62% over ToT on GPT-3.5. We reproduce the ordering on a model 25x smaller that the authors never evaluated.",
-    { x: 0.75, y: 5.6, w: 6.6, h: 0.7, isTextBox: true, fontFace: BODY,
-      fontSize: 11.5, italic: true, color: MUTE, margin: 0 });
+  s.addText("An earlier run showed GoT ahead by 17.8%. That margin was an artefact of our own ToT baseline being unable to reject a refinement that worsened the answer. Correcting the baseline reversed the result - which is why baselines get audited first.",
+    { x: 0.75, y: 5.5, w: 6.6, h: 1.0, isTextBox: true, fontFace: BODY,
+      fontSize: 11, italic: true, color: MUTE, margin: 0 });
 
-  s.addNotes("The margin over ToT is being re-measured: we found our own ToT baseline could not reject a refinement that worsened the answer, which inflated GoT's advantage. Fixed, rerunning. The ordering is unchanged.");
+  s.addNotes("Report this honestly - it is a stronger result than a confirmation. The structural claims reproduce exactly; the quality claim does not, at this scale, once the baseline is implemented correctly. Single run at temperature 1.0, so we do not yet have error bars on the 7.45 versus 8.28 gap. And note it strengthens the motivation for compression: GoT costs 3.6 times ToT and does not currently beat it.");
 }
 
 // =====================================================================
@@ -539,7 +608,7 @@ function stat(s, x, y, w, big, label, color, bg) {
 {
   const s = pres.addSlide();
   s.background = { color: NIGHT };
-  title(s, "The problem we are actually solving", "Accuracy is bought with redundancy, and redundancy is the cost", true);
+  title(s, "The problem we are actually solving", "Structure is bought with redundancy, and redundancy is paid for in tokens", true);
 
   const bars = [
     { n: "IO", v: 520, c: "4A3F7A" },
@@ -580,11 +649,11 @@ function stat(s, x, y, w, big, label, color, bg) {
     { x: 8.45, y: 5.35, w: 3.9, h: 1.05, isTextBox: true, fontFace: BODY,
       fontSize: 12, color: WHITE, margin: 0 });
 
-  s.addText("GoT wins on quality and loses on cost. Every practical deployment question is therefore: how much of this graph is actually necessary?",
+  s.addText("GoT pays 15x direct prompting and 3.6x Tree of Thoughts - and at 7B it does not beat either. The question is unavoidable: how much of this graph is actually necessary?",
     { x: 0.9, y: 5.75, w: 7.0, h: 0.8, isTextBox: true, fontFace: BODY,
       fontSize: 13, bold: true, color: AMBER, margin: 0 });
 
-  s.addNotes("This slide turns the replication into a motivation. We reproduced the quality result; we also measured exactly how expensive that quality is. Fifteen times the cost of direct prompting is what makes GoT impractical, and that gap is our target.");
+  s.addNotes("This slide turns the replication into a motivation. We measured exactly how expensive the graph is: fifteen times direct prompting, and three and a half times Tree of Thoughts. Combined with the previous slide - where ToT actually scored better - the case for compression is not aesthetic. The graph is being paid for and, at this scale, not earning it.");
 }
 
 // =====================================================================
@@ -656,12 +725,64 @@ function stat(s, x, y, w, big, label, color, bg) {
 }
 
 // =====================================================================
+// 12b. Next steps -- two orthogonal axes of compression
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: NIGHT };
+  title(s, "Next steps", "The cost of a reasoning graph factorises - and the two factors compress independently", true);
+
+  card(s, 0.75, 1.75, 11.85, 0.72, PANEL, true);
+  s.addText("cost   ~=   |V|   x   tokens per vertex", { x: 0.75, y: 1.9, w: 11.85, h: 0.42,
+    isTextBox: true, fontFace: "Courier New", fontSize: 19, bold: true,
+    color: AMBER, align: "center", margin: 0 });
+
+  card(s, 0.75, 2.72, 5.8, 2.5, PANEL, true);
+  s.addText("Axis 1    shrink each vertex", { x: 1.0, y: 2.88, w: 5.3, h: 0.3,
+    isTextBox: true, fontFace: BODY, fontSize: 13.5, bold: true, color: MINT, margin: 0 });
+  s.addText("Borrowed directly from chain-of-thought compression:",
+    { x: 1.0, y: 3.2, w: 5.3, h: 0.3, isTextBox: true, fontFace: BODY,
+      fontSize: 11, color: DIM, margin: 0 });
+  bullets(s, [
+    "Chain of Draft - cap each reasoning step at a few words",
+    "TokenSkip - prune low-utility tokens from a chain",
+    "Coconut - reason in latent space rather than in text",
+  ], 1.0, 3.55, 5.3, 1.3, 11, WHITE);
+  s.addText("Applies to every vertex; graph shape unchanged.", { x: 1.0, y: 4.88, w: 5.3, h: 0.28,
+    isTextBox: true, fontFace: BODY, fontSize: 10.5, italic: true, color: MUTE, margin: 0 });
+
+  card(s, 6.8, 2.72, 5.8, 2.5, PANEL, true);
+  s.addText("Axis 2    shrink the graph", { x: 7.05, y: 2.88, w: 5.3, h: 0.3,
+    isTextBox: true, fontFace: BODY, fontSize: 13.5, bold: true, color: AMBER, margin: 0 });
+  s.addText("Our contribution - causality-preserving coarsening:",
+    { x: 7.05, y: 3.2, w: 5.3, h: 0.3, isTextBox: true, fontFace: BODY,
+      fontSize: 11, color: DIM, margin: 0 });
+  bullets(s, [
+    "Ablate each vertex, measure its effect on the final answer",
+    "Merge or drop vertices that carry no causal weight",
+    "Constraint: preserve reachability to the final thought",
+  ], 7.05, 3.55, 5.3, 1.3, 11, WHITE);
+  s.addText("Reduces |V| without breaking information flow.", { x: 7.05, y: 4.88, w: 5.3, h: 0.28,
+    isTextBox: true, fontFace: BODY, fontSize: 10.5, italic: true, color: MUTE, margin: 0 });
+
+  card(s, 0.75, 5.45, 11.85, 1.3, "2A2158", true);
+  s.addText("The two axes are orthogonal, so their savings multiply.",
+    { x: 1.05, y: 5.6, w: 11.25, h: 0.3, isTextBox: true, fontFace: BODY,
+      fontSize: 13.5, bold: true, color: WHITE, margin: 0 });
+  s.addText("Target, set by our own measurement: match or beat error 7.45 at 2,185 tokens - the operating point Tree of Thoughts holds today. Graph of Thoughts currently sits at 8.28 error and 7,910 tokens.",
+    { x: 1.05, y: 5.95, w: 11.25, h: 0.68, isTextBox: true, fontFace: BODY,
+      fontSize: 12, color: AMBER, margin: 0 });
+
+  s.addNotes("The factorisation is the useful idea. Chain-of-thought compression is a large and fast-moving literature, but all of it operates on a single chain - it shrinks the content of a step. None of it reduces the number of steps in a graph. Coarsening does that, and because the two act on different factors they compose. The target on the last line is not aspirational: it is the ToT operating point we measured, so we will know immediately whether a coarsening is working.");
+}
+
+// =====================================================================
 // 12. Literature review and bibliography  (NEW)
 // =====================================================================
 {
   const s = pres.addSlide();
   s.background = { color: WHITE };
-  title(s, "Literature review", "Two lines of work meet in this project: reasoning structure, and graph reduction");
+  title(s, "Literature review", "Three lines of work meet here: reasoning structure, chain compression, and graph reduction");
 
   card(s, 0.75, 1.8, 5.85, 4.15, PAPER);
   s.addText("Structured reasoning in LLMs", { x: 1.0, y: 1.97, w: 5.35, h: 0.3,
@@ -682,29 +803,32 @@ function stat(s, x, y, w, big, label, color, bg) {
   });
 
   card(s, 6.95, 1.8, 5.65, 4.15, WHITE);
-  s.addText("Graph reduction and efficiency", { x: 7.2, y: 1.97, w: 5.15, h: 0.3,
+  s.addText("Compression: of chains, and of graphs", { x: 7.2, y: 1.97, w: 5.15, h: 0.3,
     isTextBox: true, fontFace: BODY, fontSize: 13.5, bold: true, color: AMBER, margin: 0 });
-  [["Loukas, 2019", "Graph Reduction with Spectral and Cut Guarantees. JMLR 20(116).", "Coarsening with provable bounds"],
-   ["Huang et al., 2021", "Scaling Up Graph Neural Networks Via Graph Coarsening. KDD.", "Coarsening applied to learning"],
+  [["Xu et al., 2025", "Chain of Draft: Thinking Faster by Writing Less. arXiv:2502.18600", "Shorter steps; our Axis 1"],
+   ["Xia et al., 2025", "TokenSkip: Controllable Chain-of-Thought Compression. arXiv:2502.12067", "Token-level pruning of a chain"],
+   ["Hao et al., 2024", "Training LLMs to Reason in a Continuous Latent Space (Coconut). arXiv:2412.06769", "Latent thoughts, no text tokens"],
+   ["Sui et al., 2025", "Stop Overthinking: A Survey on Efficient Reasoning for LLMs. TMLR.", "Survey of the CoT-compression field"],
+   ["Loukas, 2019", "Graph Reduction with Spectral and Cut Guarantees. JMLR 20(116).", "Coarsening with provable bounds"],
    ["Kwon et al., 2023", "Efficient Memory Management for LLM Serving with PagedAttention. SOSP. arXiv:2309.06180", "vLLM; our inference engine"],
   ].forEach((r, i) => {
-    const y = 2.35 + i * 0.8;
-    s.addText(r[0], { x: 7.2, y, w: 5.15, h: 0.24, isTextBox: true, fontFace: BODY,
-      fontSize: 11.5, bold: true, color: INK, margin: 0 });
-    s.addText(r[1], { x: 7.2, y: y + 0.22, w: 5.15, h: 0.3, isTextBox: true,
-      fontFace: BODY, fontSize: 9.5, color: MUTE, margin: 0 });
-    s.addText(r[2], { x: 7.2, y: y + 0.46, w: 5.15, h: 0.24, isTextBox: true,
-      fontFace: BODY, fontSize: 9.5, italic: true, color: AMBER, margin: 0 });
+    const y = 2.33 + i * 0.6;
+    s.addText(r[0], { x: 7.2, y, w: 5.15, h: 0.22, isTextBox: true, fontFace: BODY,
+      fontSize: 10.5, bold: true, color: INK, margin: 0 });
+    s.addText(r[1], { x: 7.2, y: y + 0.19, w: 5.15, h: 0.24, isTextBox: true,
+      fontFace: BODY, fontSize: 8.5, color: MUTE, margin: 0 });
+    s.addText(r[2], { x: 7.2, y: y + 0.37, w: 5.15, h: 0.2, isTextBox: true,
+      fontFace: BODY, fontSize: 8.5, italic: true, color: AMBER, margin: 0 });
   });
 
-  card(s, 7.2, 4.85, 5.15, 0.92, "FFF6E6");
-  s.addText("The gap: coarsening is well studied for data graphs, not for reasoning graphs where edges carry causality.",
-    { x: 7.45, y: 5.0, w: 4.7, h: 0.65, isTextBox: true, fontFace: BODY,
-      fontSize: 11, bold: true, color: INK, margin: 0 });
+  card(s, 7.2, 5.98, 5.15, 0.85, "FFF6E6");
+  s.addText("The gap: chain compression shrinks a step, and graph coarsening shrinks a data graph. Neither shrinks a reasoning graph whose edges carry causality.",
+    { x: 7.42, y: 6.1, w: 4.75, h: 0.62, isTextBox: true, fontFace: BODY,
+      fontSize: 9.5, bold: true, color: INK, margin: 0 });
 
   s.addText("Code and full derivations:  github.com/TREX4096/Graph_of_Thought",
-    { x: 0.75, y: 6.2, w: 11.85, h: 0.3, isTextBox: true, fontFace: BODY,
-      fontSize: 11, color: MUTE, margin: 0 });
+    { x: 0.75, y: 6.25, w: 6.0, h: 0.3, isTextBox: true, fontFace: BODY,
+      fontSize: 10.5, color: MUTE, margin: 0 });
 
   s.addNotes("The left column is the lineage we replicated. The right column is the toolkit we intend to borrow from. The gap statement is the contribution claim: spectral coarsening assumes edges encode similarity, whereas in a reasoning graph an edge means one thought was literally the input that produced another - so the guarantees have to be restated in terms of reachability to the answer.");
 }
