@@ -1,836 +1,767 @@
 // Causality-Preserving Graph Coarsening for Efficient LLM Reasoning
-// BTP deck -- 14 slides, ~14 minutes.
+// Mid-Term Review deck. Academic format, Montserrat throughout.
 //
-// Visual motif: nodes and edges. The whole project is about changing the
-// shape of a reasoning graph, so every structural claim is drawn as one.
+// FONT: Montserrat is NOT bundled with Office. Install it on the presenting
+// machine (fonts.google.com/specimen/Montserrat) or embed it via
+// File > Options > Save > Embed fonts, otherwise text reflows.
+//
+// LOGO: drop the Department of Electrical Engineering / IIT Delhi logo at
+// docs/assets/iitd_ee_logo.png and it is picked up automatically. Without it
+// the deck falls back to a text lockup.
 //
 // Regenerate:  node docs/make_deck.js docs/Graph_of_Thoughts_BTP.pptx
 
 const pptx = require("pptxgenjs");
+const fs = require("fs");
+const path = require("path");
+
 const pres = new pptx();
-pres.layout = "LAYOUT_WIDE";                  // 13.3 x 7.5 in
+pres.layout = "LAYOUT_WIDE";                     // 13.3 x 7.5 in
 const W = 13.3;
 
-// --- palette: deep indigo ground, violet primary, amber = compression ---
-const NIGHT  = "150E33";
-const PANEL  = "221A4A";
-const VIOLET = "6D4AFF";
-const AMBER  = "FFB627";
-const MINT   = "3DDC97";
-const ROSE   = "FF4D6D";
-const WHITE  = "FFFFFF";
-const INK    = "1F1A38";
-const MUTE   = "6E6A85";
-const PAPER  = "F6F4FD";
-const DIM    = "A79FCB";
+// --- palette ---------------------------------------------------------
+const BLUE  = "23408E";   // primary, academic
+const PALE  = "C9D8F5";
+const AMBER = "D98A1F";   // accent: compression
+const TEAL  = "0F7B6C";   // positive result
+const ROSE  = "C0392B";   // negative result
+const INK   = "16181D";
+const MUTE  = "63697A";
+const WHITE = "FFFFFF";
+const PAPER = "F4F6FB";
 
-// Montserrat, as requested. It is NOT bundled with Office, so it must be
-// installed on the presenting machine (free: fonts.google.com/specimen/Montserrat)
-// or embedded via File > Options > Save > Embed fonts. Otherwise PowerPoint
-// substitutes a metric-incompatible face and text reflows.
-// Montserrat sets ~8-10% wider than Calibri at the same point size, so body
-// sizes below carry deliberate slack.
-const HEAD = "Montserrat";
-const BODY = "Montserrat";
+const F = "Montserrat";
 
 pres.author = "Prasoon Raj, Nikhil Bansal";
 pres.title  = "Causality-Preserving Graph Coarsening for Efficient LLM Reasoning";
 
-// --- helpers ---------------------------------------------------------
-function title(s, t, sub, dark) {
-  s.addText(t, { x: 0.7, y: 0.4, w: W - 1.4, h: 0.68, isTextBox: true,
-    fontFace: HEAD, fontSize: 32, bold: true, color: dark ? WHITE : INK, margin: 0 });
-  if (sub) s.addText(sub, { x: 0.7, y: 1.1, w: W - 1.4, h: 0.4, isTextBox: true,
-    fontFace: BODY, fontSize: 13.5, color: dark ? DIM : MUTE, margin: 0 });
+// --- logo, if supplied ------------------------------------------------
+const LOGO = ["docs/assets/iitd_ee_logo.png", "docs/assets/logo.png",
+              "assets/iitd_ee_logo.png"]
+  .map(p => path.resolve(__dirname, "..", p))
+  .find(p => fs.existsSync(p));
+if (!LOGO) console.warn("note: no logo found at docs/assets/iitd_ee_logo.png - using text lockup");
+
+function brand(s, big) {
+  if (LOGO) {
+    s.addImage({ path: LOGO, x: 0.55, y: 0.2, w: big ? 1.5 : 1.0,
+                 h: big ? 0.75 : 0.5, sizing: { type: "contain",
+                 w: big ? 1.5 : 1.0, h: big ? 0.75 : 0.5 } });
+  } else if (big) {
+    s.addText("IIT DELHI", { x: 0.55, y: 0.24, w: 2.6, h: 0.3, isTextBox: true,
+      fontFace: F, fontSize: 14, bold: true, color: BLUE, charSpacing: 2, margin: 0 });
+    s.addText("Department of Electrical Engineering", { x: 0.55, y: 0.56, w: 3.4, h: 0.26,
+      isTextBox: true, fontFace: F, fontSize: 8.5, color: MUTE, margin: 0 });
+  }
 }
-function node(s, x, y, d, fill) {
-  s.addShape(pres.ShapeType.ellipse, { x, y, w: d, h: d, fill: { color: fill },
-    line: { color: fill, width: 0 } });
+
+// --- template furniture ----------------------------------------------
+function corner(s) {
+  s.addShape(pres.ShapeType.roundRect, { x: 11.1, y: -0.55, w: 2.6, h: 1.05,
+    rectRadius: 0.4, fill: { color: PALE }, line: { width: 0 } });
+  s.addShape(pres.ShapeType.roundRect, { x: 11.9, y: 0.0, w: 2.2, h: 0.62,
+    rectRadius: 0.3, fill: { color: BLUE }, line: { width: 0 } });
+  s.addShape(pres.ShapeType.roundRect, { x: -0.8, y: 6.95, w: 2.0, h: 0.9,
+    rectRadius: 0.35, fill: { color: BLUE }, line: { width: 0 } });
+  s.addShape(pres.ShapeType.roundRect, { x: 0.35, y: 7.2, w: 3.0, h: 0.8,
+    rectRadius: 0.35, fill: { color: PALE }, line: { width: 0 } });
 }
-function edge(s, x1, y1, x2, y2, color, width, dash) {
-  const o = { x: Math.min(x1, x2), y: Math.min(y1, y2),
-              w: Math.abs(x2 - x1), h: Math.abs(y2 - y1),
-              line: { color: color || "B9B2D6", width: width || 1 } };
-  if (dash) o.line.dashType = "dash";
-  if ((x2 - x1) * (y2 - y1) < 0) o.flipV = true;
-  s.addShape(pres.ShapeType.line, o);
+function head(s, text) {
+  corner(s);
+  if (LOGO) s.addImage({ path: LOGO, x: 11.75, y: 0.72, w: 1.0, h: 0.5,
+                         sizing: { type: "contain", w: 1.0, h: 0.5 } });
+  s.addText(text, { x: 0.62, y: 0.26, w: W - 3.4, h: 0.66, isTextBox: true,
+    fontFace: F, fontSize: 30, bold: true, color: BLUE, margin: 0 });
+  const rw = Math.min(6.6, 0.30 * text.length + 1.1);
+  s.addShape(pres.ShapeType.line, { x: 0.68, y: 1.0, w: rw, h: 0,
+    line: { color: INK, width: 1.6 } });
+  s.addShape(pres.ShapeType.ellipse, { x: 0.6, y: 0.94, w: 0.13, h: 0.13,
+    fill: { color: INK }, line: { width: 0 } });
+  s.addShape(pres.ShapeType.ellipse, { x: 0.68 + rw - 0.06, y: 0.94, w: 0.13, h: 0.13,
+    fill: { color: INK }, line: { width: 0 } });
 }
-function card(s, x, y, w, h, fill, dark) {
-  s.addShape(pres.ShapeType.roundRect, { x, y, w, h, rectRadius: 0.06,
-    fill: { color: fill || WHITE },
-    line: { color: dark ? "342A63" : "E2DCF6", width: 1 },
-    shadow: dark ? undefined
-      : { type: "outer", color: "9B92C4", blur: 8, offset: 1, angle: 90, opacity: 0.18 } });
+function sub(s, text, x, y, w, color) {
+  s.addText(text, { x, y, w: w || 6.4, h: 0.34, isTextBox: true, fontFace: F,
+    fontSize: 14.5, bold: true, color: color || BLUE, margin: 0 });
+}
+function body(s, text, x, y, w, h, size, color) {
+  s.addText(text, { x, y, w, h, isTextBox: true, fontFace: F, fontSize: size || 12,
+    color: color || INK, margin: 0, lineSpacingMultiple: 1.12 });
 }
 function bullets(s, items, x, y, w, h, size, color) {
   s.addText(items.map((t, i) => ({ text: t,
       options: { bullet: true, breakLine: i !== items.length - 1 } })),
-    { x, y, w, h, isTextBox: true, fontFace: BODY, fontSize: size || 13.5,
-      color: color || INK, paraSpaceAfter: 8, margin: 0 });
+    { x, y, w, h, isTextBox: true, fontFace: F, fontSize: size || 12,
+      color: color || INK, paraSpaceAfter: 7, margin: 0, lineSpacingMultiple: 1.1 });
 }
-function stat(s, x, y, w, big, label, color, bg) {
-  card(s, x, y, w, 1.35, bg || WHITE);
-  s.addText(big, { x, y: y + 0.12, w, h: 0.62, isTextBox: true, fontFace: HEAD,
-    fontSize: 34, bold: true, color, align: "center", margin: 0 });
-  s.addText(label, { x, y: y + 0.76, w, h: 0.46, isTextBox: true, fontFace: BODY,
-    fontSize: 10.5, color: MUTE, align: "center", margin: 0 });
+function cite(s, text) {
+  s.addText(text, { x: 4.6, y: 6.8, w: 8.2, h: 0.3, isTextBox: true, fontFace: F,
+    fontSize: 9, italic: true, color: MUTE, align: "right", margin: 0 });
 }
-
-// =====================================================================
-// 1. Title
-// =====================================================================
-{
-  const s = pres.addSlide();
-  s.background = { color: NIGHT };
-
-  // Motif: dense graph coarsening into a sparse one -- the project, in one image.
-  const d = 0.2;
-  const dense = [[10.15, 1.95], [9.35, 2.75], [10.95, 2.75], [8.95, 3.55],
-                 [10.15, 3.55], [11.35, 3.55], [9.75, 4.35], [10.75, 4.35]];
-  dense.forEach((a, i) => dense.slice(i + 1).forEach(b => {
-    if (Math.abs(a[1] - b[1]) < 0.9) edge(s, a[0] + d / 2, a[1] + d / 2, b[0] + d / 2, b[1] + d / 2, "3A2F६F".replace("६","6"), 0.75);
-  }));
-  dense.forEach(p => node(s, p[0], p[1], d, VIOLET));
-  const keep = [[10.15, 1.95], [9.35, 2.75], [10.95, 2.75], [10.15, 5.25]];
-  keep.slice(1, 3).forEach(p => {
-    edge(s, keep[0][0] + d / 2, keep[0][1] + d / 2, p[0] + d / 2, p[1] + d / 2, AMBER, 1.9);
-    edge(s, p[0] + d / 2, p[1] + d / 2, keep[3][0] + d / 2, keep[3][1] + d / 2, AMBER, 1.9);
-  });
-  keep.forEach(p => node(s, p[0], p[1], d + 0.05, AMBER));
-  s.addText("coarsen", { x: 9.5, y: 5.6, w: 1.6, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 11, italic: true, color: AMBER, align: "center", margin: 0 });
-
-  s.addText("Causality-Preserving\nGraph Coarsening", { x: 0.85, y: 1.5, w: 7.8, h: 1.7,
-    isTextBox: true, fontFace: HEAD, fontSize: 38, bold: true, color: WHITE,
-    lineSpacingMultiple: 1.05, margin: 0 });
-  s.addText("for Efficient LLM Reasoning", { x: 0.85, y: 3.2, w: 7.8, h: 0.5,
-    isTextBox: true, fontFace: HEAD, fontSize: 26, color: AMBER, margin: 0 });
-
-  s.addText([
-    { text: "Prasoon Raj", options: { bold: true } },
-    { text: "  (2023EE10708)          ", options: { color: DIM, fontSize: 13 } },
-    { text: "Nikhil Bansal", options: { bold: true } },
-    { text: "  (2023EE10787)", options: { color: DIM, fontSize: 13 } },
-  ], { x: 0.85, y: 4.25, w: 8.2, h: 0.36, isTextBox: true, fontFace: BODY,
-       fontSize: 15, color: WHITE, margin: 0 });
-
-  s.addText([
-    { text: "Guided by   ", options: { color: MUTE, fontSize: 12 } },
-    { text: "Subhanu Halder", options: { bold: true } },
-    { text: "  (PhD Scholar)", options: { color: DIM, fontSize: 12 } },
-  ], { x: 0.85, y: 4.78, w: 8.2, h: 0.32, isTextBox: true, fontFace: BODY,
-       fontSize: 13.5, color: WHITE, margin: 0 });
-  s.addText([
-    { text: "Supervisor   ", options: { color: MUTE, fontSize: 12 } },
-    { text: "Prof. Sandeep Kumar", options: { bold: true } },
-  ], { x: 0.85, y: 5.16, w: 8.2, h: 0.32, isTextBox: true, fontFace: BODY,
-       fontSize: 13.5, color: WHITE, margin: 0 });
-
-  s.addText("Department of Electrical Engineering  ·  IIT Delhi",
-    { x: 0.85, y: 5.85, w: 8.2, h: 0.32, isTextBox: true, fontFace: BODY,
-      fontSize: 12, color: MUTE, margin: 0 });
-
-  s.addNotes("One-line framing: reasoning graphs make language models more accurate but far more expensive. We want to shrink the graph without destroying the causal structure that makes it work. Step one was reproducing the baseline faithfully.");
+function card(s, x, y, w, h, fill, border) {
+  s.addShape(pres.ShapeType.roundRect, { x, y, w, h, rectRadius: 0.05,
+    fill: { color: fill || WHITE }, line: { color: border || "D8DEEC", width: 1 } });
+}
+function node(s, x, y, d, fill) {
+  s.addShape(pres.ShapeType.ellipse, { x, y, w: d, h: d,
+    fill: { color: fill }, line: { color: fill, width: 0 } });
+}
+function edge(s, x1, y1, x2, y2, color, width) {
+  const o = { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1),
+              h: Math.abs(y2 - y1), line: { color: color || "AEB6C9", width: width || 1 } };
+  if ((x2 - x1) * (y2 - y1) < 0) o.flipV = true;
+  s.addShape(pres.ShapeType.line, o);
+}
+function tbl(s, header, rows, x, y, w, colW, hi, rowH, fs) {
+  const t = [header.map(c => ({ text: c,
+    options: { bold: true, color: WHITE, fill: { color: BLUE } } }))];
+  rows.forEach((r, i) => t.push(r.map((c, j) => ({ text: c, options: {
+    bold: (hi !== undefined && i === hi) || j === 0,
+    color: (hi !== undefined && i === hi) ? AMBER : INK,
+    fill: { color: (hi !== undefined && i === hi) ? "FDF3E3" : (i % 2 ? WHITE : PAPER) } } }))));
+  s.addTable(t, { x, y, w, colW, rowH: rowH || 0.36, fontFace: F, fontSize: fs || 10,
+    border: { type: "solid", color: "DCE2EF", pt: 1 }, valign: "middle" });
 }
 
 // =====================================================================
-// 2. The bottleneck
+// 1  Title
 // =====================================================================
 {
   const s = pres.addSlide();
   s.background = { color: WHITE };
-  title(s, "Why structured reasoning exists", "A language model writes one token at a time, and every token costs the same");
+  corner(s);
+  brand(s, true);
+  s.addShape(pres.ShapeType.roundRect, { x: 0.75, y: 1.15, w: 11.8, h: 4.95,
+    rectRadius: 0.05, fill: { color: WHITE }, line: { color: INK, width: 1.2 } });
+
+  s.addText("Causality-Preserving Graph Coarsening\nfor Efficient LLM Reasoning",
+    { x: 1.3, y: 1.65, w: 10.7, h: 1.5, isTextBox: true, fontFace: F, fontSize: 29,
+      bold: true, color: BLUE, align: "center", lineSpacingMultiple: 1.14, margin: 0 });
+  s.addText("Mid Term Review", { x: 1.3, y: 3.22, w: 10.7, h: 0.42, isTextBox: true,
+    fontFace: F, fontSize: 18, bold: true, color: INK, align: "center", margin: 0 });
+
+  s.addText("Presented by  -  Prasoon Raj (2023EE10708),  Nikhil Bansal (2023EE10787)",
+    { x: 1.3, y: 4.0, w: 10.7, h: 0.32, isTextBox: true, fontFace: F,
+      fontSize: 13, color: INK, align: "center", margin: 0 });
+  s.addText("Guided by  -  Subhanu Halder (PhD Scholar)", { x: 1.3, y: 4.44, w: 10.7, h: 0.32,
+    isTextBox: true, fontFace: F, fontSize: 13, color: INK, align: "center", margin: 0 });
+  s.addText("Supervisor  -  Prof. Sandeep Kumar", { x: 1.3, y: 4.88, w: 10.7, h: 0.32,
+    isTextBox: true, fontFace: F, fontSize: 13, color: INK, align: "center", margin: 0 });
+  s.addText("Department of Electrical Engineering,  Indian Institute of Technology Delhi",
+    { x: 1.3, y: 5.45, w: 10.7, h: 0.3, isTextBox: true, fontFace: F,
+      fontSize: 11, color: MUTE, align: "center", margin: 0 });
+
+  s.addNotes("Reasoning graphs make language models more accurate but far more expensive. Our aim is to shrink the graph without destroying the causal structure that makes it work. This review covers the replication that establishes the baseline, and the compression method it motivates.");
+}
+
+// =====================================================================
+// 2  Problem Statement
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  head(s, "Problem Statement");
+
+  sub(s, "Why does LLM reasoning cost matter ?", 0.75, 1.32, 7.4);
+  bullets(s, [
+    "A language model spends identical computation on every token, and cannot allocate more effort to a harder question.",
+    "Structured prompting - Chain, Tree and Graph of Thoughts - buys accuracy by generating many intermediate thoughts.",
+    "Cost scales with the number of thoughts and the length of each. We measure Graph of Thoughts at 15x the tokens of direct prompting.",
+    "Inference cost, not accuracy, is what currently blocks deployment of graph-structured reasoning.",
+  ], 0.75, 1.78, 7.4, 2.6, 11.5);
+
+  sub(s, "Statement", 0.75, 4.6, 7.4);
+  body(s, "To compress the reasoning graph of Graph of Thoughts - reducing both the number of vertices and the tokens per vertex - while preserving the causal dependencies that carry information to the final answer.",
+    0.75, 5.05, 7.4, 1.3, 12);
+
+  card(s, 8.6, 1.32, 4.0, 4.7, PAPER);
+  s.addText("Measured cost per instance", { x: 8.85, y: 1.48, w: 3.5, h: 0.3,
+    isTextBox: true, fontFace: F, fontSize: 11, bold: true, color: BLUE, margin: 0 });
+  s.addText("64-element sorting, Qwen2.5-7B, 100 instances", { x: 8.85, y: 1.76, w: 3.5, h: 0.4,
+    isTextBox: true, fontFace: F, fontSize: 8.5, color: MUTE, margin: 0 });
+  [["IO", 520], ["CoT", 1169], ["CoT-SC", 887], ["ToT", 2185], ["GoT", 7910]]
+    .forEach((b, i) => {
+      const y = 2.3 + i * 0.68;
+      s.addText(b[0], { x: 8.85, y: y + 0.02, w: 0.85, h: 0.26, isTextBox: true,
+        fontFace: F, fontSize: 10, color: INK, margin: 0 });
+      s.addShape(pres.ShapeType.roundRect, { x: 9.72, y, w: Math.max(0.1, (b[1] / 8200) * 2.0),
+        h: 0.27, rectRadius: 0.03, fill: { color: i === 4 ? AMBER : BLUE }, line: { width: 0 } });
+      s.addText(b[1].toLocaleString(), { x: 9.78 + (b[1] / 8200) * 2.0, y: y + 0.02,
+        w: 0.95, h: 0.26, isTextBox: true, fontFace: F, fontSize: 8.5,
+        color: i === 4 ? AMBER : MUTE, margin: 0 });
+    });
+  s.addText("mean tokens consumed", { x: 8.85, y: 5.68, w: 3.5, h: 0.24, isTextBox: true,
+    fontFace: F, fontSize: 8.5, italic: true, color: MUTE, margin: 0 });
+
+  s.addNotes("Frame the problem as cost, not capability. The structural advantage of graph reasoning is established; what is not established is that anyone can afford it.");
+}
+
+// =====================================================================
+// 3  Study Summary - CoT
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  head(s, "Study Summaries");
+
+  sub(s, "Paper 1 : Chain-of-Thought Prompting Elicits Reasoning in Large Language Models", 0.75, 1.3, 11.0);
+  s.addText("( Chain structure - intermediate steps written into the prompt )",
+    { x: 0.75, y: 1.64, w: 11.0, h: 0.28, isTextBox: true, fontFace: F,
+      fontSize: 11, italic: true, color: MUTE, margin: 0 });
 
   bullets(s, [
-    "Compute per token is fixed - the model cannot allocate more effort to a harder question",
-    "Generation is irreversible - once a token is sampled, everything after it is conditioned on it",
-    "Ask directly, and an arbitrarily hard problem receives one token's worth of computation",
-  ], 0.7, 1.85, 6.4, 1.8, 13.5);
+    "Intermediate reasoning steps are emitted before the answer, with no change to model weights.",
+    "More tokens means more forward passes - the written chain IS the additional computation.",
+    "GSM8K solve rate rises from 18% to 57% on PaLM-540B under chain-of-thought prompting.",
+    "The ability is emergent: below roughly 10B parameters chains are fluent but logically invalid, and accuracy can fall below direct prompting.",
+  ], 0.75, 2.1, 6.5, 3.0, 11.5);
 
-  card(s, 0.7, 3.95, 6.4, 1.05, PAPER);
-  s.addText("Writing intermediate steps IS the extra computation - not a description of it.",
-    { x: 0.95, y: 4.18, w: 5.9, h: 0.6, isTextBox: true, fontFace: BODY,
-      fontSize: 14, bold: true, color: VIOLET, margin: 0 });
-
-  card(s, 7.55, 1.8, 5.05, 3.55);
-  s.addText("The benchmark task", { x: 7.85, y: 2.0, w: 4.5, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 13, bold: true, color: INK, margin: 0 });
-  s.addText("Sort 64 digits (0-9), with duplicates", { x: 7.85, y: 2.33, w: 4.5, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 12, color: MUTE, margin: 0 });
-  s.addText("[4, 2, 7, 2, 9, 2, 1, ...]", { x: 7.85, y: 2.78, w: 4.5, h: 0.32,
-    isTextBox: true, fontFace: "Courier New", fontSize: 14, color: INK, margin: 0 });
-  s.addText("The model must emit 2 exactly three times - with no counter and no scratch variable. Only the text it has already written.",
-    { x: 7.85, y: 3.2, w: 4.5, h: 1.0, isTextBox: true, fontFace: BODY,
-      fontSize: 12.5, color: INK, margin: 0 });
-  s.addText("A working-memory limit,\nnot a reasoning limit.", { x: 7.85, y: 4.45, w: 4.5, h: 0.6,
-    isTextBox: true, fontFace: BODY, fontSize: 13, bold: true, italic: true,
-    color: ROSE, margin: 0 });
-
-  s.addText("Digits are generated at random, so the task cannot be solved from memorised training data - the failure is isolated and measurable.",
-    { x: 0.7, y: 5.75, w: 11.9, h: 0.4, isTextBox: true, fontFace: BODY,
-      fontSize: 12, italic: true, color: MUTE, margin: 0 });
-
-  s.addNotes("Sorting is chosen because it needs no world knowledge. Any improvement is attributable to reasoning structure, not recall.");
-}
-
-// =====================================================================
-// 3. The ladder
-// =====================================================================
-{
-  const s = pres.addSlide();
-  s.background = { color: WHITE };
-  title(s, "Four schemes, one question", "What shape should the model's intermediate reasoning take?");
-
-  const cols = [
-    { x: 0.75, n: "CoT", sub: "chain", note: "show the steps" },
-    { x: 3.85, n: "CoT-SC", sub: "k chains", note: "sample, then select" },
-    { x: 6.95, n: "ToT", sub: "tree", note: "branch and backtrack" },
-    { x: 10.05, n: "GoT", sub: "graph", note: "AGGREGATE" },
-  ];
-  const cw = 2.5, top = 2.05, d = 0.19, rowH = 0.5;
-
-  cols.forEach((c, ci) => {
-    const hl = ci === 3;
-    card(s, c.x, top, cw, 3.1, hl ? "FFF6E6" : WHITE);
-    s.addText(c.n, { x: c.x, y: top + 0.12, w: cw, h: 0.34, isTextBox: true,
-      fontFace: HEAD, fontSize: 19, bold: true, color: hl ? AMBER : INK,
-      align: "center", margin: 0 });
-    s.addText(c.sub, { x: c.x, y: top + 0.48, w: cw, h: 0.26, isTextBox: true,
-      fontFace: BODY, fontSize: 11.5, color: MUTE, align: "center", margin: 0 });
-
-    const mx = c.x + cw / 2 - d / 2, gy = top + 0.88;
-    if (ci === 0) {
-      for (let i = 0; i < 4; i++) {
-        if (i) edge(s, mx + d / 2, gy + (i - 1) * rowH + d / 2, mx + d / 2, gy + i * rowH + d / 2, VIOLET, 1.2);
-        node(s, mx, gy + i * rowH, d, VIOLET);
-      }
-    } else if (ci === 1) {
-      [-0.6, 0, 0.6].forEach(o => {
-        for (let i = 0; i < 3; i++) {
-          if (i) edge(s, mx + o + d / 2, gy + (i - 1) * rowH + d / 2, mx + o + d / 2, gy + i * rowH + d / 2, VIOLET, 1.2);
-          node(s, mx + o, gy + i * rowH, d, VIOLET);
-        }
-      });
-    } else if (ci === 2) {
-      node(s, mx, gy, d, VIOLET);
-      [-0.64, 0, 0.64].forEach(o => {
-        edge(s, mx + d / 2, gy + d / 2, mx + o + d / 2, gy + rowH + d / 2, VIOLET, 1.2);
-        node(s, mx + o, gy + rowH, d, VIOLET);
-        [-0.21, 0.21].forEach(o2 => {
-          edge(s, mx + o + d / 2, gy + rowH + d / 2, mx + o + o2 + d / 2, gy + 2 * rowH + d / 2, VIOLET, 1.2);
-          node(s, mx + o + o2, gy + 2 * rowH, d, (o === 0 && o2 === 0.21) ? VIOLET : "CFC7E8");
-        });
-      });
-    } else {
-      node(s, mx, gy, d, VIOLET);
-      const mids = [-0.7, -0.23, 0.23, 0.7];
-      mids.forEach(o => {
-        edge(s, mx + d / 2, gy + d / 2, mx + o + d / 2, gy + rowH + d / 2, VIOLET, 1.2);
-        node(s, mx + o, gy + rowH, d, VIOLET);
-      });
-      [-0.47, 0.47].forEach((mo, mi) => {
-        [mids[mi * 2], mids[mi * 2 + 1]].forEach(o =>
-          edge(s, mx + o + d / 2, gy + rowH + d / 2, mx + mo + d / 2, gy + 2 * rowH + d / 2, AMBER, 1.7));
-        node(s, mx + mo, gy + 2 * rowH, d, AMBER);
-        edge(s, mx + mo + d / 2, gy + 2 * rowH + d / 2, mx + d / 2, gy + 3 * rowH + d / 2, AMBER, 1.7);
-      });
-      node(s, mx, gy + 3 * rowH, d, AMBER);
-    }
-    s.addText(c.note, { x: c.x, y: top + 2.68, w: cw, h: 0.3, isTextBox: true,
-      fontFace: BODY, fontSize: 11.5, bold: hl, color: hl ? AMBER : MUTE,
-      align: "center", margin: 0 });
-  });
-
-  card(s, 0.75, 5.5, 11.85, 1.1, NIGHT, true);
-  s.addText("Aggregation requires a vertex with in-degree > 1. A tree cannot contain one, by definition.",
-    { x: 1.05, y: 5.67, w: 11.25, h: 0.36, isTextBox: true, fontFace: BODY,
-      fontSize: 15.5, bold: true, color: WHITE, margin: 0 });
-  s.addText("Removing that constraint is the entire contribution of Graph of Thoughts - and the structure we aim to compress.",
-    { x: 1.05, y: 6.05, w: 11.25, h: 0.32, isTextBox: true, fontFace: BODY,
-      fontSize: 12.5, color: DIM, margin: 0 });
-
-  s.addNotes("Each scheme fixes a limitation of the previous one. CoT-SC samples several chains but they never exchange information. ToT can branch and backtrack but never merge. GoT allows merging, which is what a tree structurally cannot express.");
-}
-
-// =====================================================================
-// 4. Framework
-// =====================================================================
-{
-  const s = pres.addSlide();
-  s.background = { color: WHITE };
-  title(s, "The GoT framework", "Two distinct graphs - conflating them is the most common implementation error");
-
-  card(s, 0.75, 1.8, 5.8, 1.95, PAPER);
-  s.addText("Graph of Operations (GoO)", { x: 1.05, y: 1.97, w: 5.2, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 14, bold: true, color: VIOLET, margin: 0 });
-  s.addText("Static execution plan, constructed before the run.\nVertices are operations; edges are dependencies.\nOne per task configuration.",
-    { x: 1.05, y: 2.32, w: 5.2, h: 1.2, isTextBox: true, fontFace: BODY,
-      fontSize: 12.5, color: INK, margin: 0 });
-
-  card(s, 6.8, 1.8, 5.8, 1.95, PAPER);
-  s.addText("Graph Reasoning State (GRS)", { x: 7.1, y: 1.97, w: 5.2, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 14, bold: true, color: MINT, margin: 0 });
-  s.addText("Dynamic record of the thoughts actually produced.\nVertices are LLM outputs; edges are data dependencies.\nOne per input instance.",
-    { x: 7.1, y: 2.32, w: 5.2, h: 1.2, isTextBox: true, fontFace: BODY,
-      fontSize: 12.5, color: INK, margin: 0 });
-
-  s.addText("Three transformations - and only these create vertices",
-    { x: 0.75, y: 3.95, w: 11.85, h: 0.34, isTextBox: true, fontFace: BODY,
-      fontSize: 14.5, bold: true, color: INK, margin: 0 });
-
-  [{ n: "Generate (k)", d: "One thought in, k out.\nBranching. Already present\nin ToT.", c: VIOLET },
-   { n: "Aggregate (k)", d: "k thoughts in, one out.\nAn edge from every input.\nThe novel operation.", c: AMBER },
-   { n: "Improve", d: "Refine a thought in place.\nA cycle - also impossible\nwithin a tree.", c: MINT },
-  ].forEach((o, i) => {
-    const x = 0.75 + i * 4.03;
-    card(s, x, 4.38, 3.78, 1.72, o.c === AMBER ? "FFF6E6" : WHITE);
-    s.addShape(pres.ShapeType.ellipse, { x: x + 0.28, y: 4.62, w: 0.4, h: 0.4,
-      fill: { color: o.c }, line: { width: 0 } });
-    s.addText(String(i + 1), { x: x + 0.28, y: 4.66, w: 0.4, h: 0.32, isTextBox: true,
-      fontFace: BODY, fontSize: 12.5, bold: true, color: WHITE, align: "center", margin: 0 });
-    s.addText(o.n, { x: x + 0.82, y: 4.64, w: 2.8, h: 0.3, isTextBox: true,
-      fontFace: BODY, fontSize: 13.5, bold: true, color: o.c, margin: 0 });
-    s.addText(o.d, { x: x + 0.3, y: 5.1, w: 3.25, h: 0.9, isTextBox: true,
-      fontFace: BODY, fontSize: 11, color: INK, margin: 0 });
-  });
-
-  s.addText("Score, KeepBest and GroundTruth create no vertices - they annotate and filter. Edges denote causality: an edge (a, b) means a's text was literally the input that produced b.",
-    { x: 0.75, y: 6.3, w: 11.85, h: 0.55, isTextBox: true, fontFace: BODY,
-      fontSize: 11.5, italic: true, color: MUTE, margin: 0 });
-
-  s.addNotes("The last line is the one that matters for our method. Edges are causal dependencies, not loose associations - which is exactly what a coarsening procedure has to preserve.");
-}
-
-// =====================================================================
-// 4b. How the graph builds its vertices and edges  (paper Sec 3.2, 4.5)
-// =====================================================================
-{
-  const s = pres.addSlide();
-  s.background = { color: WHITE };
-  title(s, "How vertices and edges are constructed", "Besta et al., Sections 3.2 and 4.5 - the rule set any coarsening must respect");
-
-  card(s, 0.75, 1.78, 5.5, 2.15, NIGHT, true);
-  s.addText("The engine builds the state graph with one loop", { x: 1.0, y: 1.93, w: 5.0, h: 0.28,
-    isTextBox: true, fontFace: BODY, fontSize: 12, bold: true, color: AMBER, margin: 0 });
-  s.addText("for op in TOPOLOGICAL-ORDER(GoO):\n    parents <- thoughts of op.predecessors\n    for t in op.EXECUTE(parents):\n        V <- V + {t}\n        for p in t.parents:\n            E <- E + {(p, t)}",
-    { x: 1.0, y: 2.28, w: 5.0, h: 1.45, isTextBox: true, fontFace: "Courier New",
-      fontSize: 10.5, color: WHITE, margin: 0 });
-
-  s.addText("Topological order is required, not stylistic: with aggregation the plan is a DAG, so running operations in the order written is not sufficient.",
-    { x: 0.75, y: 4.02, w: 5.5, h: 0.62, isTextBox: true, fontFace: BODY,
-      fontSize: 11, italic: true, color: MUTE, margin: 0 });
-
-  const tb = [["Operation", "Vertices created", "Edges created"].map(t =>
-    ({ text: t, options: { bold: true, color: WHITE, fill: { color: VIOLET } } }))];
-  [["Generate (k)", "k per input", "input -> each new"],
-   ["Aggregate (k)", "k, from all inputs", "EVERY input -> each new"],
-   ["Improve", "1 per input", "input -> new"],
-   ["Score", "none", "none"],
-   ["KeepBest (n)", "none", "none"],
-   ["GroundTruth", "none", "none"]].forEach((r, i) => {
-    const hl = i === 1, zero = i >= 3;
-    tb.push(r.map((c, j) => ({ text: c, options: { bold: hl || j === 0,
-      color: hl ? AMBER : (zero ? MUTE : INK),
-      fill: { color: hl ? "FFF6E6" : (i % 2 ? WHITE : PAPER) } } })));
-  });
-  s.addTable(tb, { x: 6.6, y: 1.78, w: 6.0, colW: [1.85, 1.9, 2.25], rowH: 0.38,
-    fontFace: BODY, fontSize: 11, border: { type: "solid", color: "E2DCF6", pt: 1 },
-    valign: "middle" });
-
-  s.addText("Only Generate, Aggregate and Improve create vertices - exactly the paper's three thought transformations. Score and KeepBest annotate and filter.",
-    { x: 6.6, y: 4.48, w: 6.0, h: 0.6, isTextBox: true, fontFace: BODY,
-      fontSize: 11, italic: true, color: MUTE, margin: 0 });
-
-  card(s, 0.75, 4.85, 5.5, 1.8, "FFF6E6");
-  s.addText("The defining rule", { x: 1.0, y: 5.0, w: 3.0, h: 0.28, isTextBox: true,
-    fontFace: BODY, fontSize: 12, bold: true, color: AMBER, margin: 0 });
-  const d2 = 0.17, ay = 5.45;
-  [-0.75, -0.25, 0.25, 0.75].forEach(o => {
-    edge(s, 2.6 + o + d2 / 2, ay + d2 / 2, 2.6 + d2 / 2, ay + 0.72 + d2 / 2, AMBER, 1.8);
-    node(s, 2.6 + o, ay, d2, VIOLET);
-  });
-  node(s, 2.6, ay + 0.72, d2 + 0.03, AMBER);
-  s.addText("in-degree = 4 > 1\nso the graph is not a tree", { x: 3.55, y: 5.5, w: 2.55, h: 0.62,
-    isTextBox: true, fontFace: BODY, fontSize: 11, bold: true, color: INK, margin: 0 });
-
-  card(s, 6.6, 5.2, 6.0, 1.45, PANEL, true);
-  s.addText("An edge (a, b) means a's text was literally the input that produced b.",
-    { x: 6.85, y: 5.36, w: 5.5, h: 0.32, isTextBox: true, fontFace: BODY,
-      fontSize: 12.5, bold: true, color: WHITE, margin: 0 });
-  s.addText("Edges encode causality, not similarity - which is why a coarsening operator cannot simply merge similar vertices. It must preserve which thoughts can still reach the answer.",
-    { x: 6.85, y: 5.73, w: 5.5, h: 0.82, isTextBox: true, fontFace: BODY,
-      fontSize: 11, color: DIM, margin: 0 });
-
-  s.addNotes("Worked example on 32 numbers: the first merge level creates 20 vertices but 40 edges, because every merge draws an edge from both of its inputs. That doubling is the fan-in, and it is the only point in the trace where edges outnumber vertices. It is also exactly what a coarsening step has to account for.");
-}
-
-// =====================================================================
-// 5. Use case
-// =====================================================================
-{
-  const s = pres.addSlide();
-  s.background = { color: WHITE };
-  title(s, "Use case: merge sort executed by an LLM", "Decompose until each sub-problem lies inside the model's reliable range");
-
-  const d = 0.23, gy = 2.2, rowH = 0.82;
-  const lvl = [[5.9], [3.3, 5.0, 6.8, 8.5], [4.15, 7.65], [5.9]];
-  const cols = [VIOLET, VIOLET, AMBER, AMBER];
-  const labels = ["64 numbers", "sort 16 each (k=3)", "merge (k=10)", "merge - final answer"];
-
-  for (let L = 1; L < 4; L++) {
-    lvl[L].forEach((x, i) => {
-      const par = L === 1 ? lvl[0] : (L === 2 ? [lvl[1][i * 2], lvl[1][i * 2 + 1]] : lvl[2]);
-      par.forEach(px => edge(s, px + d / 2, gy + (L - 1) * rowH + d / 2,
-                              x + d / 2, gy + L * rowH + d / 2,
-                              L >= 2 ? AMBER : "B9B2D6", L >= 2 ? 1.8 : 1.1));
-    });
+  card(s, 7.6, 2.1, 5.0, 3.6, PAPER);
+  s.addText("Structure", { x: 7.85, y: 2.26, w: 4.5, h: 0.28, isTextBox: true,
+    fontFace: F, fontSize: 11, bold: true, color: BLUE, margin: 0 });
+  const d = 0.21;
+  for (let i = 0; i < 5; i++) {
+    if (i) edge(s, 8.35 + d / 2, 2.72 + (i - 1) * 0.6 + d / 2, 8.35 + d / 2, 2.72 + i * 0.6 + d / 2, BLUE, 1.4);
+    node(s, 8.35, 2.72 + i * 0.6, d, i === 4 ? AMBER : BLUE);
   }
-  lvl.forEach((row, L) => row.forEach(x => node(s, x, gy + L * rowH, d, cols[L])));
-  labels.forEach((t, L) => s.addText(t, { x: 0.8, y: gy + L * rowH - 0.05, w: 2.2, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 11.5, color: L >= 2 ? AMBER : MUTE,
-    align: "right", margin: 0 }));
-  s.addText("fan out", { x: 8.9, y: gy + 0.5, w: 1.3, h: 0.26, isTextBox: true,
-    fontFace: BODY, fontSize: 11, italic: true, color: MUTE, margin: 0 });
-  s.addText("fan back in", { x: 8.9, y: gy + 2.05, w: 1.5, h: 0.26, isTextBox: true,
-    fontFace: BODY, fontSize: 11, italic: true, bold: true, color: AMBER, margin: 0 });
+  ["input x", "thought z1", "thought z2", "thought z3", "answer y"].forEach((t, i) =>
+    s.addText(t, { x: 8.78, y: 2.72 + i * 0.6 - 0.02, w: 3.4, h: 0.26, isTextBox: true,
+      fontFace: F, fontSize: 10, color: i === 4 ? AMBER : INK, margin: 0 }));
+  s.addText("A single path. A wrong step is unrecoverable.", { x: 7.85, y: 5.25, w: 4.5, h: 0.3,
+    isTextBox: true, fontFace: F, fontSize: 9.5, italic: true, color: MUTE, margin: 0 });
 
-  stat(s, 10.55, 2.05, 2.05, "39", "thoughts per\ninstance", VIOLET, PAPER);
-  stat(s, 10.55, 3.6, 2.05, "15", "aggregations\n(ToT has 0)", AMBER, "FFF6E6");
-
-  card(s, 0.75, 5.6, 11.85, 1.0, PAPER);
-  s.addText("Sorting 16 numbers is reliable. Merging two sorted lists is reliable. Sorting 64 from scratch is not. So perform only the reliable operations.",
-    { x: 1.05, y: 5.82, w: 11.25, h: 0.5, isTextBox: true, fontFace: BODY,
-      fontSize: 13.5, bold: true, color: VIOLET, margin: 0 });
-
-  s.addNotes("Scoring here is an exact Python function - count inversions, compare digit frequencies - so it is free and never wrong. That matters later: it gives us a reliable signal for deciding which parts of the graph are worth keeping.");
+  cite(s, "Wei et al., NeurIPS 2022, arXiv:2201.11903");
+  s.addNotes("The foundational result. The emergence threshold matters for us: it explains why our 7B experiments behave differently from the paper's GPT-3.5 results.");
 }
 
 // =====================================================================
-// 6. Datasets
+// 4  Study Summary - ToT
 // =====================================================================
 {
   const s = pres.addSlide();
   s.background = { color: WHITE };
-  title(s, "Datasets", "All tasks are synthetic, with computed ground truth - and the authors publish the exact files they ran");
+  head(s, "Study Summaries");
 
-  const hdr = ["Task", "Input", "Sizes", "Instances"];
-  const rows = [
-    ["Sorting", "digits 0-9, with duplicates", "32 / 64 / 128", "100"],
+  sub(s, "Paper 2 : Tree of Thoughts - Deliberate Problem Solving with Large Language Models", 0.75, 1.3, 11.0);
+  s.addText("( Tree structure - branching, evaluation and backtracking )",
+    { x: 0.75, y: 1.64, w: 11.0, h: 0.28, isTextBox: true, fontFace: F,
+      fontSize: 11, italic: true, color: MUTE, margin: 0 });
+
+  bullets(s, [
+    "Three components: a thought generator producing k children, a state evaluator scoring them, and a search algorithm over the tree.",
+    "Adds local exploration and backtracking, which Self-Consistency with CoT cannot do - its k chains never exchange information.",
+    "Every vertex has exactly one parent, so information on a discarded branch is lost permanently.",
+    "In our replication ToT is the strongest baseline, once its evaluator can reject a refinement that worsens the answer.",
+  ], 0.75, 2.1, 6.5, 3.0, 11.5);
+
+  card(s, 7.6, 2.1, 5.0, 3.6, PAPER);
+  s.addText("Structure", { x: 7.85, y: 2.26, w: 4.5, h: 0.28, isTextBox: true,
+    fontFace: F, fontSize: 11, bold: true, color: BLUE, margin: 0 });
+  const d = 0.19, cx = 10.0;
+  node(s, cx, 2.8, d, BLUE);
+  [-1.0, 0, 1.0].forEach(o => {
+    edge(s, cx + d / 2, 2.8 + d / 2, cx + o + d / 2, 3.6 + d / 2, BLUE, 1.3);
+    node(s, cx + o, 3.6, d, BLUE);
+    [-0.3, 0.3].forEach(o2 => {
+      edge(s, cx + o + d / 2, 3.6 + d / 2, cx + o + o2 + d / 2, 4.4 + d / 2, BLUE, 1.3);
+      node(s, cx + o + o2, 4.4, d, (o === 0 && o2 === 0.3) ? AMBER : "B9C2D8");
+    });
+  });
+  s.addText("Only one root-to-leaf path reaches the answer; the remainder of the tree is discarded.",
+    { x: 7.85, y: 4.95, w: 4.5, h: 0.6, isTextBox: true, fontFace: F,
+      fontSize: 9.5, italic: true, color: MUTE, margin: 0 });
+
+  cite(s, "Yao et al., NeurIPS 2023, arXiv:2305.10601");
+  s.addNotes("The one-parent constraint is exactly what Graph of Thoughts removes. It is also why a tree wastes most of what it computes.");
+}
+
+// =====================================================================
+// 5  Study Summary - GoT
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  head(s, "Study Summaries");
+
+  sub(s, "Paper 3 : Graph of Thoughts - Solving Elaborate Problems with Large Language Models", 0.75, 1.3, 11.0);
+  s.addText("( Graph structure - our baseline, and the object we compress )",
+    { x: 0.75, y: 1.64, w: 11.0, h: 0.28, isTextBox: true, fontFace: F,
+      fontSize: 11, italic: true, color: AMBER, margin: 0 });
+
+  bullets(s, [
+    "Reasoning is a directed graph: vertices are thoughts, and an edge (a,b) means a's text was the direct input that produced b.",
+    "Aggregation merges k thoughts into one, creating a vertex of in-degree k > 1 - which a tree cannot contain, by definition.",
+    "Reported gains of 62% in sorting quality over ToT with a 31% cost reduction, on ChatGPT-3.5.",
+    "Latency log-k N at volume N: the only scheme where every computed thought retains a causal path to the answer.",
+  ], 0.75, 2.1, 6.5, 3.0, 11.5);
+
+  card(s, 7.6, 2.1, 5.0, 3.7, "FDF3E3");
+  s.addText("Structure - merge sort executed by an LLM", { x: 7.85, y: 2.26, w: 4.5, h: 0.28,
+    isTextBox: true, fontFace: F, fontSize: 10.5, bold: true, color: AMBER, margin: 0 });
+  const d = 0.18, lv = [[10.05], [8.85, 9.65, 10.45, 11.25], [9.25, 10.85], [10.05]];
+  const yy = [2.8, 3.45, 4.2, 4.95];
+  for (let L = 1; L < 4; L++) lv[L].forEach((x, i) => {
+    const par = L === 1 ? lv[0] : (L === 2 ? [lv[1][i * 2], lv[1][i * 2 + 1]] : lv[2]);
+    par.forEach(px => edge(s, px + d / 2, yy[L - 1] + d / 2, x + d / 2, yy[L] + d / 2,
+                           L >= 2 ? AMBER : "AEB6C9", L >= 2 ? 1.7 : 1.1));
+  });
+  lv.forEach((r, L) => r.forEach(x => node(s, x, yy[L], d, L >= 2 ? AMBER : BLUE)));
+  s.addText("split  ->  sort chunks  ->  merge  ->  merge", { x: 7.85, y: 5.38, w: 4.5, h: 0.28,
+    isTextBox: true, fontFace: F, fontSize: 9.5, color: INK, align: "center", margin: 0 });
+
+  cite(s, "Besta et al., AAAI 2024, arXiv:2308.09687");
+  s.addNotes("This is the paper we replicated. The merge steps, in amber, are the operation no tree can express - and also where most of the cost sits.");
+}
+
+// =====================================================================
+// 6  Study Summary - CoT compression
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  head(s, "Study Summaries");
+
+  sub(s, "Paper 4 : Compression of Chain-of-Thought Reasoning", 0.75, 1.3, 11.0);
+  s.addText("( The literature we borrow from - all of it operates on a single chain )",
+    { x: 0.75, y: 1.64, w: 11.0, h: 0.28, isTextBox: true, fontFace: F,
+      fontSize: 11, italic: true, color: MUTE, margin: 0 });
+
+  tbl(s, ["Method", "Mechanism", "Reported effect"], [
+    ["Chain of Draft", "Cap each reasoning step to a few words", "~7.6% of CoT tokens, accuracy retained"],
+    ["TokenSkip", "Prune low-utility tokens from the chain", "Controllable compression ratio"],
+    ["Coconut", "Feed the hidden state back instead of decoding", "Reasoning without emitting text tokens"],
+    ["Token budgeting", "Allocate a budget per step by difficulty", "Adaptive depth, less overthinking"],
+  ], 0.75, 2.1, 7.5, [1.7, 2.9, 2.9], undefined, 0.56, 9.5);
+
+  bullets(s, [
+    "Every method above shortens the CONTENT of a reasoning step.",
+    "None reduces the NUMBER of steps, because a chain has no structure to remove.",
+    "A graph does - and that is the gap this project occupies.",
+  ], 0.75, 4.75, 7.5, 1.3, 11.5);
+
+  card(s, 8.6, 2.1, 4.0, 4.0, PAPER);
+  s.addText("Two independent factors", { x: 8.85, y: 2.28, w: 3.5, h: 0.3,
+    isTextBox: true, fontFace: F, fontSize: 11, bold: true, color: BLUE, margin: 0 });
+  s.addText("cost  =  |V|  x  tokens/vertex", { x: 8.85, y: 2.68, w: 3.5, h: 0.34,
+    isTextBox: true, fontFace: F, fontSize: 11.5, bold: true, color: AMBER, margin: 0 });
+  s.addShape(pres.ShapeType.line, { x: 9.45, y: 3.04, w: 0, h: 0.85,
+    line: { color: AMBER, width: 1.6 } });
+  s.addShape(pres.ShapeType.line, { x: 11.3, y: 3.04, w: 0, h: 0.4,
+    line: { color: TEAL, width: 1.6 } });
+  s.addText("Graph coarsening\nacts on this factor", { x: 8.85, y: 3.92, w: 1.9, h: 0.6,
+    isTextBox: true, fontFace: F, fontSize: 9.5, color: AMBER, margin: 0 });
+  s.addText("Chain compression\nacts on this one", { x: 10.85, y: 3.48, w: 1.7, h: 0.6,
+    isTextBox: true, fontFace: F, fontSize: 9.5, color: TEAL, margin: 0 });
+  s.addText("The factors are orthogonal, so the two compressions compose and their savings multiply.",
+    { x: 8.85, y: 4.9, w: 3.5, h: 0.95, isTextBox: true, fontFace: F,
+      fontSize: 10.5, bold: true, color: BLUE, margin: 0 });
+
+  cite(s, "Xu et al. arXiv:2502.18600  |  Xia et al. arXiv:2502.12067  |  Hao et al. arXiv:2412.06769");
+  s.addNotes("This is the key literature insight. Chain compression is a large and fast-moving field, but it all shrinks a step. Reducing the number of steps requires structure, which only a graph has.");
+}
+
+// =====================================================================
+// 7  Objectives and Scope
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  head(s, "Objectives & Scope of Work");
+
+  bullets(s, [
+    "Faithful replication of Graph of Thoughts on open-weights models, with all four baselines on one engine",
+    "Verification of the structural claims - volume, latency, aggregation count - independently of model quality",
+    "Measurement of where the cost of a reasoning graph actually accumulates",
+    "Application of chain-of-thought compression to the content of each vertex",
+    "Development of a causality-preserving coarsening operator that reduces the number of vertices",
+    "Evaluation of the compressed graph against the Tree of Thoughts cost-quality frontier",
+  ], 0.9, 1.5, 7.3, 4.2, 12.5);
+
+  card(s, 8.6, 1.45, 4.0, 4.6, PAPER);
+  s.addText("Status at mid-term", { x: 8.85, y: 1.63, w: 3.5, h: 0.3, isTextBox: true,
+    fontFace: F, fontSize: 11.5, bold: true, color: BLUE, margin: 0 });
+  [["Replication framework", "done", TEAL], ["Structural verification", "done", TEAL],
+   ["Cost characterisation", "done", TEAL], ["Naive-compression study", "done", TEAL],
+   ["Vertex compression", "in progress", AMBER], ["Coarsening operator", "planned", MUTE],
+   ["Frontier evaluation", "planned", MUTE],
+  ].forEach((r, i) => {
+    const y = 2.12 + i * 0.53;
+    s.addShape(pres.ShapeType.ellipse, { x: 8.9, y: y + 0.06, w: 0.13, h: 0.13,
+      fill: { color: r[2] }, line: { width: 0 } });
+    s.addText(r[0], { x: 9.12, y, w: 2.25, h: 0.26, isTextBox: true, fontFace: F,
+      fontSize: 9.5, color: INK, margin: 0 });
+    s.addText(r[1], { x: 11.3, y, w: 1.1, h: 0.26, isTextBox: true, fontFace: F,
+      fontSize: 8.5, bold: true, color: r[2], align: "right", margin: 0 });
+  });
+
+  s.addNotes("Four of seven objectives are complete. The remaining three are the contribution itself, and the measurements already made define their target.");
+}
+
+// =====================================================================
+// 8  Methodology - graph construction
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  head(s, "Methodology");
+
+  sub(s, "1) How the reasoning graph constructs its vertices and edges", 0.75, 1.3, 11.0);
+
+  card(s, 0.75, 1.72, 5.6, 2.0, PAPER);
+  s.addText("Execution loop over the plan", { x: 1.0, y: 1.85, w: 5.1, h: 0.26,
+    isTextBox: true, fontFace: F, fontSize: 10, bold: true, color: BLUE, margin: 0 });
+  s.addText("for op in TOPOLOGICAL-ORDER(GoO):\n   parents <- thoughts of op.predecessors\n   for t in op.EXECUTE(parents):\n      V <- V + { t }\n      for p in t.parents:\n         E <- E + { (p, t) }",
+    { x: 1.0, y: 2.16, w: 5.1, h: 1.42, isTextBox: true, fontFace: "Courier New",
+      fontSize: 9.5, color: INK, margin: 0 });
+
+  tbl(s, ["Operation", "Vertices", "Edges"], [
+    ["Generate (k)", "k per input", "input -> each new"],
+    ["Aggregate (k)", "k, from all inputs", "EVERY input -> each new"],
+    ["Improve", "1 per input", "input -> new"],
+    ["Score", "none", "none"],
+    ["KeepBest (n)", "none", "none"],
+  ], 6.75, 1.72, 5.8, [1.75, 1.85, 2.2], 1, 0.35, 9.5);
+
+  s.addText("Only Generate, Aggregate and Improve create vertices. Score and KeepBest annotate and filter.",
+    { x: 6.75, y: 3.9, w: 5.8, h: 0.3, isTextBox: true, fontFace: F,
+      fontSize: 9.5, italic: true, color: MUTE, margin: 0 });
+
+  sub(s, "2) The rule that defines the structure", 0.75, 4.3, 11.0);
+  card(s, 0.75, 4.72, 5.6, 1.9, "FDF3E3");
+  const d = 0.16, ay = 5.18;
+  [-0.7, -0.23, 0.23, 0.7].forEach(o => {
+    edge(s, 2.3 + o + d / 2, ay + d / 2, 2.3 + d / 2, ay + 0.72 + d / 2, AMBER, 1.7);
+    node(s, 2.3 + o, ay, d, BLUE);
+  });
+  node(s, 2.3, ay + 0.72, d + 0.03, AMBER);
+  s.addText("in-degree 4 > 1\nso the graph is not a tree", { x: 3.25, y: 5.3, w: 2.9, h: 0.6,
+    isTextBox: true, fontFace: F, fontSize: 10.5, bold: true, color: INK, margin: 0 });
+
+  card(s, 6.75, 4.72, 5.8, 1.9, PAPER);
+  s.addText("An edge (a, b) means a's text was literally the input that produced b.",
+    { x: 7.0, y: 4.9, w: 5.3, h: 0.32, isTextBox: true, fontFace: F,
+      fontSize: 11, bold: true, color: BLUE, margin: 0 });
+  s.addText("Edges encode causality, not similarity. A coarsening operator therefore cannot merge vertices because they resemble one another - it must preserve which thoughts can still reach the answer.",
+    { x: 7.0, y: 5.3, w: 5.3, h: 1.15, isTextBox: true, fontFace: F,
+      fontSize: 10, color: INK, margin: 0 });
+
+  s.addNotes("Worked example on 32 numbers: the first merge level creates 20 vertices but 40 edges, because each merge draws an edge from both inputs. That fan-in is what a coarsening step has to account for.");
+}
+
+// =====================================================================
+// 9  Methodology - setup
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  head(s, "Methodology");
+
+  sub(s, "3) Datasets - synthetic, with computed ground truth", 0.75, 1.3, 7.4);
+  tbl(s, ["Task", "Input", "Sizes", "Instances"], [
+    ["Sorting", "digits 0-9 with duplicates", "32 / 64 / 128", "100"],
     ["Set intersection", "two sets, 25-75% overlap", "32 / 64 / 128", "100"],
     ["Keyword counting", "country mentions in text", "4 / 8 / 16 sentences", "-"],
     ["Document merging", "overlapping NDA documents", "4 documents", "-"],
-  ];
-  const tb = [hdr.map(t => ({ text: t, options: { bold: true, color: WHITE, fill: { color: VIOLET } } }))];
-  rows.forEach((r, i) => tb.push(r.map((c, j) => ({ text: c, options: {
-    bold: j === 0, color: INK, fill: { color: i % 2 ? WHITE : PAPER } } }))));
-  s.addTable(tb, { x: 0.75, y: 1.8, w: 7.7, colW: [1.9, 2.85, 1.75, 1.2], rowH: 0.42,
-    fontFace: BODY, fontSize: 12, border: { type: "solid", color: "E2DCF6", pt: 1 },
-    valign: "middle" });
+  ], 0.75, 1.7, 7.4, [1.8, 2.65, 1.75, 1.2], undefined, 0.38, 9.5);
 
-  bullets(s, [
-    "No public benchmark - ground truth is computed, never annotated",
-    "Randomly generated, so no possibility of training-data contamination",
-    "Difficulty is a controlled variable: 32 - 64 - 128 elements",
-  ], 0.75, 4.1, 7.7, 1.25, 12.5);
+  s.addText("Run on the authors' own published CSV files, byte for byte - eliminating differing random data as an explanation for any discrepancy.",
+    { x: 0.75, y: 3.6, w: 7.4, h: 0.45, isTextBox: true, fontFace: F,
+      fontSize: 10, italic: true, color: MUTE, margin: 0 });
 
-  card(s, 8.75, 1.8, 3.85, 2.35, PAPER);
-  s.addText("What we ran", { x: 9.0, y: 1.97, w: 3.35, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 13, bold: true, color: VIOLET, margin: 0 });
-  s.addText("The authors' own CSV files, byte for byte:", { x: 9.0, y: 2.3, w: 3.4, h: 0.4,
-    isTextBox: true, fontFace: BODY, fontSize: 11.5, color: INK, margin: 0 });
-  s.addText("data/official/\n  sorting_064.csv\n  set_intersection_032.csv",
-    { x: 9.0, y: 2.78, w: 3.4, h: 0.72, isTextBox: true, fontFace: "Courier New",
-      fontSize: 10, color: VIOLET, margin: 0 });
-  s.addText("Eliminates \"different random data\" as an explanation for any discrepancy.",
-    { x: 9.0, y: 3.55, w: 3.4, h: 0.5, isTextBox: true, fontFace: BODY,
-      fontSize: 10.5, italic: true, color: MUTE, margin: 0 });
+  sub(s, "4) Models and infrastructure", 0.75, 4.15, 7.4);
+  tbl(s, ["", "Original paper", "This work"], [
+    ["Model", "ChatGPT-3.5 (closed API)", "Qwen2.5-7B-Instruct (open)"],
+    ["Serving", "Vendor API", "vLLM on NVIDIA RTX A6000"],
+    ["Sampling", "Temperature 1.0, 4k context", "Identical"],
+    ["Samples", "100 per configuration", "100 per configuration"],
+  ], 0.75, 4.55, 7.4, [1.35, 3.05, 3.0], undefined, 0.38, 9.5);
 
-  card(s, 8.75, 4.35, 3.85, 2.0, WHITE);
-  s.addText("Also regenerable", { x: 9.0, y: 4.52, w: 3.35, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 13, bold: true, color: MINT, margin: 0 });
-  s.addText("generate_data.py --seed 42", { x: 9.0, y: 4.86, w: 3.4, h: 0.28,
-    isTextBox: true, fontFace: "Courier New", fontSize: 10, color: INK, margin: 0 });
-  s.addText("Byte-identical on any machine, so laptop and GPU results are directly comparable - and we can test sizes the authors never published.",
-    { x: 9.0, y: 5.2, w: 3.4, h: 1.0, isTextBox: true, fontFace: BODY,
-      fontSize: 10.5, color: MUTE, margin: 0 });
-
-  s.addNotes("Synthetic data is a deliberate strength. With a public benchmark you could never separate improved reasoning from memorised answers.");
-}
-
-// =====================================================================
-// 7. Setup
-// =====================================================================
-{
-  const s = pres.addSlide();
-  s.background = { color: WHITE };
-  title(s, "Experimental setup", "The original model is closed and deprecated - so we replicate the claims, not the exact figures");
-
-  card(s, 0.75, 1.8, 5.8, 2.4, PAPER);
-  s.addText("Original paper", { x: 1.05, y: 1.97, w: 5.2, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 14.5, bold: true, color: MUTE, margin: 0 });
-  bullets(s, ["ChatGPT-3.5 via paid API",
-              "Temperature 1.0, 4k context window",
-              "100 samples per configuration",
-              "Llama-2 attempted, then abandoned"],
-    1.05, 2.35, 5.2, 1.7, 12.5, "3C3757");
-
-  card(s, 6.8, 1.8, 5.8, 2.4, WHITE);
-  s.addText("This work", { x: 7.1, y: 1.97, w: 5.2, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 14.5, bold: true, color: MINT, margin: 0 });
-  bullets(s, ["Qwen2.5-7B-Instruct, open weights",
-              "Identical temperature and sample count",
-              "vLLM inference on NVIDIA RTX A6000",
-              "No API keys, fully self-hosted"],
-    7.1, 2.35, 5.2, 1.7, 12.5);
-
-  [{ n: "4", l: "interchangeable backends\nmock / llama.cpp / HF / vLLM", c: VIOLET },
-   { n: "5", l: "schemes on one engine\nIO, CoT, CoT-SC, ToT, GoT", c: MINT },
-   { n: "60", l: "automated tests, run\nbefore every GPU job", c: AMBER },
-  ].forEach((st, i) => {
-    const x = 0.75 + i * 4.03;
-    card(s, x, 4.45, 3.78, 1.6, WHITE);
-    s.addText(st.n, { x: x + 0.25, y: 4.62, w: 1.05, h: 0.72, isTextBox: true,
-      fontFace: HEAD, fontSize: 36, bold: true, color: st.c, margin: 0 });
-    s.addText(st.l, { x: x + 1.3, y: 4.75, w: 2.3, h: 0.9, isTextBox: true,
-      fontFace: BODY, fontSize: 11, color: INK, margin: 0 });
+  card(s, 8.6, 1.7, 4.0, 4.35, PAPER);
+  s.addText("Experimental control", { x: 8.85, y: 1.88, w: 3.5, h: 0.3, isTextBox: true,
+    fontFace: F, fontSize: 11.5, bold: true, color: BLUE, margin: 0 });
+  s.addText("All five schemes share one controller, one backend, one prompt set and one scorer.",
+    { x: 8.85, y: 2.26, w: 3.5, h: 0.78, isTextBox: true, fontFace: F,
+      fontSize: 10.5, color: INK, margin: 0 });
+  s.addText("Any measured difference is therefore attributable to graph structure alone.",
+    { x: 8.85, y: 3.06, w: 3.5, h: 0.72, isTextBox: true, fontFace: F,
+      fontSize: 10.5, bold: true, color: AMBER, margin: 0 });
+  [["5", "schemes on one engine"], ["4", "interchangeable backends"],
+   ["60", "automated tests per run"]].forEach((r, i) => {
+    const y = 3.95 + i * 0.68;
+    s.addText(r[0], { x: 8.85, y, w: 0.95, h: 0.42, isTextBox: true, fontFace: F,
+      fontSize: 21, bold: true, color: BLUE, margin: 0 });
+    s.addText(r[1], { x: 9.8, y: y + 0.1, w: 2.55, h: 0.3, isTextBox: true,
+      fontFace: F, fontSize: 9, color: MUTE, margin: 0 });
   });
 
-  s.addText("All five schemes share one controller, one backend, one prompt set and one scorer - so any measured difference is attributable to graph structure alone.",
-    { x: 0.75, y: 6.25, w: 11.85, h: 0.4, isTextBox: true, fontFace: BODY,
-      fontSize: 12, italic: true, color: MUTE, margin: 0 });
-
-  s.addNotes("The final line is the experimental design. One engine, five graph shapes - that is what isolates structure as the independent variable.");
+  s.addNotes("The paper's model is deprecated and closed, so exact figures cannot be reproduced. What can be reproduced are the relative claims, and those are what we test.");
 }
 
 // =====================================================================
-// 8. Structural results
+// 10  Results - structural
 // =====================================================================
 {
   const s = pres.addSlide();
   s.background = { color: WHITE };
-  title(s, "Result 1: structural claims hold exactly", "Volume and latency are properties of the graph, independent of the model");
+  head(s, "Results & Discussion");
 
-  const tb = [["Scheme", "Volume", "Latency", "Aggregations"].map(t =>
-    ({ text: t, options: { bold: true, color: WHITE, fill: { color: VIOLET } } }))];
-  [["IO", "1.0", "1.0", "0"], ["CoT", "2.0", "2.0", "0"], ["CoT-SC", "2.0", "2.0", "0"],
-   ["ToT", "6.0", "6.0", "0"], ["GoT", "20.0", "9.0", "15"]].forEach((r, i) => {
-    const hl = i === 4;
-    tb.push(r.map((c, j) => ({ text: c, options: { bold: hl || j === 0,
-      color: hl ? AMBER : INK, fill: { color: hl ? "FFF6E6" : (i % 2 ? WHITE : PAPER) } } })));
+  sub(s, "Structural claims - model-independent, and reproduced exactly", 0.75, 1.3, 11.0);
+
+  tbl(s, ["Scheme", "Volume", "Latency", "Aggregations"], [
+    ["IO", "1.0", "1.0", "0"], ["CoT", "2.0", "2.0", "0"],
+    ["CoT-SC", "2.0", "2.0", "0"], ["ToT", "5.3", "5.3", "0"],
+    ["GoT", "20.0", "9.0", "15"],
+  ], 0.75, 1.72, 6.2, [1.6, 1.5, 1.5, 1.6], 4, 0.4, 10);
+
+  body(s, "Volume is the number of prior thoughts with a causal path to the final answer; latency is the count of sequential model calls. Both are properties of the graph, so they cannot vary with model quality - a deviation here would indicate a defect, not a finding.",
+    0.75, 4.3, 6.2, 1.25, 10.5);
+
+  card(s, 0.75, 5.7, 6.2, 0.95, "E8F4F1");
+  s.addText("Graph of Thoughts is the only scheme that aggregates - measured, not assumed. Every other scheme reports exactly zero.",
+    { x: 1.0, y: 5.86, w: 5.7, h: 0.64, isTextBox: true, fontFace: F,
+      fontSize: 10.5, bold: true, color: TEAL, margin: 0 });
+
+  s.addChart(pres.ChartType.bar, [
+    { name: "Volume", labels: ["IO", "CoT", "CoT-SC", "ToT", "GoT"], values: [1, 2, 2, 5.3, 20] },
+    { name: "Latency", labels: ["IO", "CoT", "CoT-SC", "ToT", "GoT"], values: [1, 2, 2, 5.3, 9] },
+  ], {
+    x: 7.3, y: 1.72, w: 5.3, h: 4.1, barDir: "col", barGrouping: "clustered",
+    chartColors: [AMBER, BLUE], showTitle: true, title: "Volume vs latency per scheme",
+    titleFontFace: F, titleFontSize: 11, titleColor: INK,
+    showValue: true, dataLabelPosition: "outEnd", dataLabelFontSize: 8.5,
+    dataLabelColor: INK, showLegend: true, legendPos: "b", legendFontSize: 9.5,
+    catAxisLabelColor: MUTE, valAxisLabelColor: MUTE, catAxisLabelFontSize: 9.5,
+    valAxisLabelFontSize: 8.5, valGridLine: { color: "EDF0F7", size: 1 },
+    catGridLine: { style: "none" }, chartArea: { fill: { color: WHITE } },
   });
-  s.addTable(tb, { x: 0.75, y: 1.9, w: 6.5, colW: [1.7, 1.55, 1.55, 1.7], rowH: 0.44,
-    fontFace: BODY, fontSize: 12.5, border: { type: "solid", color: "E2DCF6", pt: 1 },
-    valign: "middle" });
 
-  card(s, 7.7, 1.9, 4.9, 1.45, NIGHT, true);
-  s.addText("22 / 22", { x: 7.7, y: 2.04, w: 4.9, h: 0.6, isTextBox: true, fontFace: HEAD,
-    fontSize: 34, bold: true, color: WHITE, align: "center", margin: 0 });
-  s.addText("structural checks pass, verified automatically on every run",
-    { x: 7.95, y: 2.66, w: 4.4, h: 0.5, isTextBox: true, fontFace: BODY,
-      fontSize: 11, color: DIM, align: "center", margin: 0 });
-
-  card(s, 7.7, 3.55, 4.9, 1.85, "FFF6E6");
-  s.addText("The key measurement", { x: 7.95, y: 3.72, w: 4.4, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 13, bold: true, color: AMBER, margin: 0 });
-  s.addText("GoT achieves volume 20 at latency 9.\nToT achieves volume 6 at latency 6.",
-    { x: 7.95, y: 4.05, w: 4.4, h: 0.62, isTextBox: true, fontFace: BODY,
-      fontSize: 12.5, color: INK, margin: 0 });
-  s.addText("Three times the information reaching the answer, for 1.5x the depth.",
-    { x: 7.95, y: 4.72, w: 4.4, h: 0.56, isTextBox: true, fontFace: BODY,
-      fontSize: 12, bold: true, color: VIOLET, margin: 0 });
-
-  s.addText("Volume = number of prior thoughts with a causal path to the final answer.    Latency = sequential model calls required.",
-    { x: 0.75, y: 5.7, w: 11.85, h: 0.32, isTextBox: true, fontFace: BODY,
-      fontSize: 11.5, italic: true, color: MUTE, margin: 0 });
-  s.addText("GoT is the only scheme that aggregates - measured, not assumed. Every other scheme reports exactly zero.",
-    { x: 0.75, y: 6.08, w: 11.85, h: 0.32, isTextBox: true, fontFace: BODY,
-      fontSize: 13, bold: true, color: INK, margin: 0 });
-
-  s.addNotes("Volume is the quantity our compression must preserve. It measures how much of the computed work can actually influence the answer. A tree wastes nearly all of it; GoT's merges pull every branch back in.");
+  s.addNotes("The gap between the amber and blue bars for GoT is the whole point of the paper: high volume at low latency. Every other scheme has the bars equal, because a chain or tree wastes what it computes.");
 }
 
 // =====================================================================
-// 9. Quality results
+// 11  Results - quality
 // =====================================================================
 {
   const s = pres.addSlide();
   s.background = { color: WHITE };
-  title(s, "Result 2: quality does not reproduce at 7B", "100 instances, 64-element sorting, the authors' dataset, zero parse failures");
+  head(s, "Results & Discussion");
+
+  sub(s, "Quality - the paper's claim does not reproduce at 7B", 0.75, 1.3, 11.0);
 
   s.addChart(pres.ChartType.bar, [{
-    name: "Error scope",
-    labels: ["IO", "CoT", "CoT-SC", "ToT", "GoT"],
+    name: "Error scope", labels: ["IO", "CoT", "CoT-SC", "ToT", "GoT"],
     values: [9.83, 10.34, 8.17, 7.45, 8.28],
   }], {
-    x: 0.75, y: 1.85, w: 6.6, h: 3.5, barDir: "col",
-    chartColors: [VIOLET, VIOLET, VIOLET, MINT, AMBER],
-    showTitle: true, title: "Mean error scope (lower is better)",
-    titleFontFace: BODY, titleFontSize: 13, titleColor: INK,
-    showValue: true, dataLabelPosition: "outEnd", dataLabelFontSize: 11,
+    x: 0.75, y: 1.72, w: 6.3, h: 3.75, barDir: "col",
+    chartColors: [BLUE, BLUE, BLUE, TEAL, AMBER],
+    showTitle: true, title: "Mean error scope, 100 instances (lower is better)",
+    titleFontFace: F, titleFontSize: 11, titleColor: INK,
+    showValue: true, dataLabelPosition: "outEnd", dataLabelFontSize: 9.5,
     dataLabelColor: INK, dataLabelFormatCode: "0.00", showLegend: false,
-    catAxisLabelColor: MUTE, valAxisLabelColor: MUTE, catAxisLabelFontSize: 11,
-    valAxisLabelFontSize: 10, valGridLine: { color: "EFEBFA", size: 1 },
+    catAxisLabelColor: MUTE, valAxisLabelColor: MUTE, catAxisLabelFontSize: 10,
+    valAxisLabelFontSize: 8.5, valGridLine: { color: "EDF0F7", size: 1 },
     catGridLine: { style: "none" }, valAxisMaxVal: 12,
     chartArea: { fill: { color: WHITE } },
   });
+  body(s, "Parse-failure rate was 0.0% for every scheme, so the pipeline is sound and the ordering is meaningful.",
+    0.75, 5.62, 6.3, 0.5, 10, MUTE);
 
-  card(s, 7.7, 1.85, 4.9, 1.42, "EAFBF3");
-  s.addText("Structure does help", { x: 7.95, y: 2.0, w: 4.4, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 13.5, bold: true, color: MINT, margin: 0 });
-  s.addText("GoT improves on direct prompting by 15.8%, and every structural claim reproduces exactly.",
-    { x: 7.95, y: 2.33, w: 4.4, h: 0.85, isTextBox: true, fontFace: BODY,
-      fontSize: 11.5, color: INK, margin: 0 });
+  card(s, 7.4, 1.72, 5.2, 1.5, "E8F4F1");
+  s.addText("Structure does help", { x: 7.65, y: 1.87, w: 4.7, h: 0.28, isTextBox: true,
+    fontFace: F, fontSize: 11.5, bold: true, color: TEAL, margin: 0 });
+  s.addText("Graph of Thoughts improves on direct prompting by 15.8%, and all structural claims hold exactly.",
+    { x: 7.65, y: 2.19, w: 4.7, h: 0.9, isTextBox: true, fontFace: F,
+      fontSize: 10, color: INK, margin: 0 });
 
-  card(s, 7.7, 3.42, 4.9, 1.5, "FFEEF1");
-  s.addText("But ToT wins here", { x: 7.95, y: 3.57, w: 4.4, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 13.5, bold: true, color: ROSE, margin: 0 });
-  s.addText("ToT scores 11.1% lower error than GoT while using 3.6x fewer tokens. The paper's quality claim does not hold in this regime.",
-    { x: 7.95, y: 3.9, w: 4.4, h: 0.95, isTextBox: true, fontFace: BODY,
-      fontSize: 11.5, color: INK, margin: 0 });
+  card(s, 7.4, 3.38, 5.2, 1.6, "FBEBE9");
+  s.addText("But Tree of Thoughts wins here", { x: 7.65, y: 3.53, w: 4.7, h: 0.28,
+    isTextBox: true, fontFace: F, fontSize: 11.5, bold: true, color: ROSE, margin: 0 });
+  s.addText("ToT reaches 11.1% lower error than GoT while consuming 3.6x fewer tokens.",
+    { x: 7.65, y: 3.85, w: 4.7, h: 0.58, isTextBox: true, fontFace: F,
+      fontSize: 10, color: INK, margin: 0 });
+  s.addText("Likely causes: an exact scorer makes ToT's monotone refinement very strong, and at 7B each of GoT's 15 merges is an opportunity to fail.",
+    { x: 7.65, y: 4.4, w: 4.7, h: 0.55, isTextBox: true, fontFace: F,
+      fontSize: 9, italic: true, color: MUTE, margin: 0 });
 
-  card(s, 7.7, 5.07, 4.9, 1.55, PANEL, true);
-  s.addText("Two likely reasons", { x: 7.95, y: 5.22, w: 4.4, h: 0.3, isTextBox: true,
-    fontFace: BODY, fontSize: 13, bold: true, color: AMBER, margin: 0 });
-  s.addText("An exact scorer makes ToT's monotone refinement very strong; and at 7B each of GoT's 15 merge steps is an opportunity to fail.",
-    { x: 7.95, y: 5.55, w: 4.4, h: 0.95, isTextBox: true, fontFace: BODY,
-      fontSize: 11, color: WHITE, margin: 0 });
+  card(s, 7.4, 5.14, 5.2, 1.5, PAPER);
+  s.addText("A note on baselines", { x: 7.65, y: 5.29, w: 4.7, h: 0.28, isTextBox: true,
+    fontFace: F, fontSize: 11.5, bold: true, color: BLUE, margin: 0 });
+  s.addText("An earlier run showed GoT ahead by 17.8%. That margin was an artefact of our own ToT implementation being unable to reject a refinement that worsened the answer. Correcting it reversed the result.",
+    { x: 7.65, y: 5.6, w: 4.7, h: 0.95, isTextBox: true, fontFace: F,
+      fontSize: 9, color: INK, margin: 0 });
 
-  s.addText("An earlier run showed GoT ahead by 17.8%. That margin was an artefact of our own ToT baseline being unable to reject a refinement that worsened the answer. Correcting the baseline reversed the result - which is why baselines get audited first.",
-    { x: 0.75, y: 5.5, w: 6.6, h: 1.0, isTextBox: true, fontFace: BODY,
-      fontSize: 11, italic: true, color: MUTE, margin: 0 });
-
-  s.addNotes("Report this honestly - it is a stronger result than a confirmation. The structural claims reproduce exactly; the quality claim does not, at this scale, once the baseline is implemented correctly. Single run at temperature 1.0, so we do not yet have error bars on the 7.45 versus 8.28 gap. And note it strengthens the motivation for compression: GoT costs 3.6 times ToT and does not currently beat it.");
+  s.addNotes("Present this honestly - a negative result that survives a corrected baseline is stronger evidence than a confirmation. It also sharpens the motivation: the graph is being paid for and, at this scale, is not earning it.");
 }
 
 // =====================================================================
-// 10. The cost problem  (NEW)
-// =====================================================================
-{
-  const s = pres.addSlide();
-  s.background = { color: NIGHT };
-  title(s, "The problem we are actually solving", "Structure is bought with redundancy, and redundancy is paid for in tokens", true);
-
-  const bars = [
-    { n: "IO", v: 520, c: "4A3F7A" },
-    { n: "CoT", v: 1169, c: "4A3F7A" },
-    { n: "CoT-SC", v: 887, c: "4A3F7A" },
-    { n: "ToT", v: 2192, c: VIOLET },
-    { n: "GoT", v: 7899, c: AMBER },
-  ];
-  const bx = 0.9, by = 2.0, bw = 6.4, maxV = 8200, rowH = 0.62;
-  bars.forEach((b, i) => {
-    const y = by + i * rowH;
-    s.addText(b.n, { x: bx, y: y + 0.02, w: 1.0, h: 0.3, isTextBox: true,
-      fontFace: BODY, fontSize: 12, color: WHITE, margin: 0 });
-    s.addShape(pres.ShapeType.roundRect, { x: bx + 1.05, y, w: Math.max(0.12, (b.v / maxV) * bw),
-      h: 0.34, rectRadius: 0.04, fill: { color: b.c }, line: { width: 0 } });
-    s.addText(b.v.toLocaleString() + " tokens", { x: bx + 1.15 + (b.v / maxV) * bw, y: y + 0.02,
-      w: 1.9, h: 0.3, isTextBox: true, fontFace: BODY, fontSize: 11,
-      color: b.n === "GoT" ? AMBER : DIM, margin: 0 });
-  });
-  s.addText("Mean tokens per instance, 64-element sorting, Qwen2.5-7B",
-    { x: 0.9, y: 5.2, w: 7.0, h: 0.3, isTextBox: true, fontFace: BODY,
-      fontSize: 11, italic: true, color: MUTE, margin: 0 });
-
-  card(s, 8.15, 1.95, 4.45, 1.45, PANEL, true);
-  s.addText("15x", { x: 8.15, y: 2.08, w: 4.45, h: 0.6, isTextBox: true, fontFace: HEAD,
-    fontSize: 34, bold: true, color: AMBER, align: "center", margin: 0 });
-  s.addText("the cost of direct prompting", { x: 8.15, y: 2.7, w: 4.45, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 11.5, color: DIM, align: "center", margin: 0 });
-
-  card(s, 8.15, 3.55, 4.45, 1.45, PANEL, true);
-  s.addText("3.6x", { x: 8.15, y: 3.68, w: 4.45, h: 0.6, isTextBox: true, fontFace: HEAD,
-    fontSize: 34, bold: true, color: VIOLET, align: "center", margin: 0 });
-  s.addText("the cost of Tree of Thoughts", { x: 8.15, y: 4.3, w: 4.45, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 11.5, color: DIM, align: "center", margin: 0 });
-
-  card(s, 8.15, 5.15, 4.45, 1.5, PANEL, true);
-  s.addText("39 vertices, 15 aggregations, 8 sequential model calls - for one sorted list.",
-    { x: 8.45, y: 5.35, w: 3.9, h: 1.05, isTextBox: true, fontFace: BODY,
-      fontSize: 12, color: WHITE, margin: 0 });
-
-  s.addText("GoT pays 15x direct prompting and 3.6x Tree of Thoughts - and at 7B it does not beat either. The question is unavoidable: how much of this graph is actually necessary?",
-    { x: 0.9, y: 5.75, w: 7.0, h: 0.8, isTextBox: true, fontFace: BODY,
-      fontSize: 13, bold: true, color: AMBER, margin: 0 });
-
-  s.addNotes("This slide turns the replication into a motivation. We measured exactly how expensive the graph is: fifteen times direct prompting, and three and a half times Tree of Thoughts. Combined with the previous slide - where ToT actually scored better - the case for compression is not aesthetic. The graph is being paid for and, at this scale, not earning it.");
-}
-
-// =====================================================================
-// 11. Naive approach vs our goal  (NEW)
+// 12  Results - cost, naive compression
 // =====================================================================
 {
   const s = pres.addSlide();
   s.background = { color: WHITE };
-  title(s, "Naive compression, and why it fails", "Turning the knobs down reduces cost - and destroys the structure that produced the quality");
+  head(s, "Results & Discussion");
 
-  const tb = [["Configuration", "Tokens", "Volume", "Error"].map(t =>
-    ({ text: t, options: { bold: true, color: WHITE, fill: { color: VIOLET } } }))];
-  [["8 chunks", "14,384", "39.9", "2.88"],
-   ["4 chunks (paper)", "8,565", "19.9", "3.20"],
-   ["2 chunks", "5,163", "9.9", "3.38"],
-   ["stripped down", "950", "8.0", "10.50"]].forEach((r, i) => {
-    const bad = i === 3;
-    tb.push(r.map((c, j) => ({ text: c, options: { bold: bad || j === 0,
-      color: bad ? ROSE : INK, fill: { color: bad ? "FFEEF1" : (i % 2 ? WHITE : PAPER) } } })));
-  });
-  s.addTable(tb, { x: 0.75, y: 1.85, w: 6.3, colW: [2.1, 1.5, 1.35, 1.35], rowH: 0.44,
-    fontFace: BODY, fontSize: 12.5, border: { type: "solid", color: "E2DCF6", pt: 1 },
-    valign: "middle" });
+  sub(s, "Cost, and why naive compression fails", 0.75, 1.3, 11.0);
 
-  card(s, 0.75, 4.25, 6.3, 1.15, "FFEEF1");
-  s.addText("Cut cost 9x and the error rises to 10.50 - worse than using no reasoning structure at all (IO scores 9.83).",
-    { x: 1.0, y: 4.45, w: 5.85, h: 0.75, isTextBox: true, fontFace: BODY,
-      fontSize: 12.5, bold: true, color: ROSE, margin: 0 });
+  tbl(s, ["Configuration", "Tokens", "Volume", "Error"], [
+    ["8 chunks", "14,384", "39.9", "2.88"],
+    ["4 chunks (paper)", "8,565", "19.9", "3.20"],
+    ["2 chunks", "5,163", "9.9", "3.38"],
+    ["stripped down", "950", "8.0", "10.50"],
+  ], 0.75, 1.72, 6.3, [2.1, 1.5, 1.35, 1.35], 3, 0.42, 10);
 
-  s.addText("Uniform pruning is structure-blind: it removes useful and redundant computation at the same rate.",
-    { x: 0.75, y: 5.55, w: 6.3, h: 0.6, isTextBox: true, fontFace: BODY,
-      fontSize: 12, italic: true, color: MUTE, margin: 0 });
+  card(s, 0.75, 3.85, 6.3, 1.1, "FBEBE9");
+  s.addText("Reducing cost ninefold raises the error to 10.50 - worse than using no reasoning structure at all, where direct prompting scores 9.83.",
+    { x: 1.0, y: 4.02, w: 5.8, h: 0.8, isTextBox: true, fontFace: F,
+      fontSize: 10.5, bold: true, color: ROSE, margin: 0 });
 
-  // Right: the proposal, drawn
-  card(s, 7.5, 1.85, 5.1, 4.65, PAPER);
-  s.addText("Our approach", { x: 7.8, y: 2.02, w: 4.5, h: 0.32, isTextBox: true,
-    fontFace: BODY, fontSize: 14.5, bold: true, color: AMBER, margin: 0 });
-  s.addText("Causality-preserving graph coarsening", { x: 7.8, y: 2.36, w: 4.5, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 12, italic: true, color: MUTE, margin: 0 });
+  body(s, "Uniform pruning is structure-blind: lowering k or the chunk count removes useful and redundant computation at the same rate. Cost and quality stay coupled, so no setting of the existing knobs reaches the Tree of Thoughts frontier.",
+    0.75, 5.1, 6.3, 1.3, 10.5);
 
-  const d = 0.17;
-  const dense = [[8.35, 3.0], [8.05, 3.6], [8.65, 3.6], [7.9, 4.2], [8.5, 4.2], [9.1, 4.2], [8.35, 4.8]];
-  dense.forEach((a, i) => dense.slice(i + 1).forEach(b => {
-    if (Math.abs(a[1] - b[1]) < 0.7) edge(s, a[0] + d / 2, a[1] + d / 2, b[0] + d / 2, b[1] + d / 2, "C7BFE6", 0.9);
-  }));
-  dense.forEach(p => node(s, p[0], p[1], d, VIOLET));
-  s.addText("39 vertices", { x: 7.65, y: 5.15, w: 1.5, h: 0.26, isTextBox: true,
-    fontFace: BODY, fontSize: 10.5, color: MUTE, align: "center", margin: 0 });
+  card(s, 7.4, 1.72, 5.2, 4.7, PAPER);
+  s.addText("Where the cost accumulates", { x: 7.65, y: 1.9, w: 4.7, h: 0.3,
+    isTextBox: true, fontFace: F, fontSize: 11.5, bold: true, color: BLUE, margin: 0 });
+  [["Chunk sorting", 1580, BLUE], ["Merge level 1", 2890, AMBER],
+   ["Merge level 2", 2210, AMBER], ["Final refinement", 1230, BLUE]]
+    .forEach((p, i) => {
+      const y = 2.42 + i * 0.75;
+      s.addText(p[0], { x: 7.65, y, w: 1.85, h: 0.26, isTextBox: true, fontFace: F,
+        fontSize: 9.5, color: INK, margin: 0 });
+      s.addShape(pres.ShapeType.roundRect, { x: 9.55, y, w: (p[1] / 3000) * 1.95, h: 0.26,
+        rectRadius: 0.03, fill: { color: p[2] }, line: { width: 0 } });
+      s.addText(String(p[1]), { x: 9.61 + (p[1] / 3000) * 1.95, y, w: 0.85, h: 0.26,
+        isTextBox: true, fontFace: F, fontSize: 8.5, color: MUTE, margin: 0 });
+    });
+  s.addText("Aggregation consumes roughly 65% of the budget - each merge emits a full-length list, and there are fifteen of them.",
+    { x: 7.65, y: 5.5, w: 4.7, h: 0.8, isTextBox: true, fontFace: F,
+      fontSize: 10, bold: true, color: AMBER, margin: 0 });
 
-  s.addShape(pres.ShapeType.rightArrow, { x: 9.65, y: 3.82, w: 0.72, h: 0.3,
-    fill: { color: AMBER }, line: { width: 0 } });
-
-  const sparse = [[11.15, 3.0], [10.75, 3.75], [11.55, 3.75], [11.15, 4.8]];
-  sparse.slice(1, 3).forEach(p => {
-    edge(s, sparse[0][0] + d / 2, sparse[0][1] + d / 2, p[0] + d / 2, p[1] + d / 2, AMBER, 1.8);
-    edge(s, p[0] + d / 2, p[1] + d / 2, sparse[3][0] + d / 2, sparse[3][1] + d / 2, AMBER, 1.8);
-  });
-  sparse.forEach(p => node(s, p[0], p[1], d + 0.03, AMBER));
-  s.addText("fewer vertices,\nsame causal paths", { x: 10.4, y: 5.15, w: 1.9, h: 0.45,
-    isTextBox: true, fontFace: BODY, fontSize: 10.5, color: AMBER, align: "center", margin: 0 });
-
-  bullets(s, [
-    "Edges are causal, not associative - (a,b) means a produced b",
-    "Coarsen vertices while preserving reachability to the answer",
-    "Target: GoT accuracy at a cost approaching ToT",
-  ], 7.8, 5.7, 4.6, 0.8, 11, INK);
-
-  s.addNotes("The naive baseline is real data we measured, not a straw man. The point is that cost and quality are coupled under uniform pruning. Coarsening asks a different question: which vertices can be merged or dropped without breaking the causal paths that carry information to the answer? Volume is the quantity to preserve; token count is the quantity to reduce.");
+  s.addNotes("The right panel is the useful diagnostic: cost is concentrated in aggregation, not in chunk sorting. That tells us where both compression axes should be aimed first.");
 }
 
 // =====================================================================
-// 12b. Next steps -- two orthogonal axes of compression
-// =====================================================================
-{
-  const s = pres.addSlide();
-  s.background = { color: NIGHT };
-  title(s, "Next steps", "The cost of a reasoning graph factorises - and the two factors compress independently", true);
-
-  card(s, 0.75, 1.75, 11.85, 0.72, PANEL, true);
-  s.addText("cost   ~=   |V|   x   tokens per vertex", { x: 0.75, y: 1.9, w: 11.85, h: 0.42,
-    isTextBox: true, fontFace: "Courier New", fontSize: 19, bold: true,
-    color: AMBER, align: "center", margin: 0 });
-
-  card(s, 0.75, 2.72, 5.8, 2.5, PANEL, true);
-  s.addText("Axis 1    shrink each vertex", { x: 1.0, y: 2.88, w: 5.3, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 13.5, bold: true, color: MINT, margin: 0 });
-  s.addText("Borrowed directly from chain-of-thought compression:",
-    { x: 1.0, y: 3.2, w: 5.3, h: 0.3, isTextBox: true, fontFace: BODY,
-      fontSize: 11, color: DIM, margin: 0 });
-  bullets(s, [
-    "Chain of Draft - cap each reasoning step at a few words",
-    "TokenSkip - prune low-utility tokens from a chain",
-    "Coconut - reason in latent space rather than in text",
-  ], 1.0, 3.55, 5.3, 1.3, 11, WHITE);
-  s.addText("Applies to every vertex; graph shape unchanged.", { x: 1.0, y: 4.88, w: 5.3, h: 0.28,
-    isTextBox: true, fontFace: BODY, fontSize: 10.5, italic: true, color: MUTE, margin: 0 });
-
-  card(s, 6.8, 2.72, 5.8, 2.5, PANEL, true);
-  s.addText("Axis 2    shrink the graph", { x: 7.05, y: 2.88, w: 5.3, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 13.5, bold: true, color: AMBER, margin: 0 });
-  s.addText("Our contribution - causality-preserving coarsening:",
-    { x: 7.05, y: 3.2, w: 5.3, h: 0.3, isTextBox: true, fontFace: BODY,
-      fontSize: 11, color: DIM, margin: 0 });
-  bullets(s, [
-    "Ablate each vertex, measure its effect on the final answer",
-    "Merge or drop vertices that carry no causal weight",
-    "Constraint: preserve reachability to the final thought",
-  ], 7.05, 3.55, 5.3, 1.3, 11, WHITE);
-  s.addText("Reduces |V| without breaking information flow.", { x: 7.05, y: 4.88, w: 5.3, h: 0.28,
-    isTextBox: true, fontFace: BODY, fontSize: 10.5, italic: true, color: MUTE, margin: 0 });
-
-  card(s, 0.75, 5.45, 11.85, 1.3, "2A2158", true);
-  s.addText("The two axes are orthogonal, so their savings multiply.",
-    { x: 1.05, y: 5.6, w: 11.25, h: 0.3, isTextBox: true, fontFace: BODY,
-      fontSize: 13.5, bold: true, color: WHITE, margin: 0 });
-  s.addText("Target, set by our own measurement: match or beat error 7.45 at 2,185 tokens - the operating point Tree of Thoughts holds today. Graph of Thoughts currently sits at 8.28 error and 7,910 tokens.",
-    { x: 1.05, y: 5.95, w: 11.25, h: 0.68, isTextBox: true, fontFace: BODY,
-      fontSize: 12, color: AMBER, margin: 0 });
-
-  s.addNotes("The factorisation is the useful idea. Chain-of-thought compression is a large and fast-moving literature, but all of it operates on a single chain - it shrinks the content of a step. None of it reduces the number of steps in a graph. Coarsening does that, and because the two act on different factors they compose. The target on the last line is not aspirational: it is the ToT operating point we measured, so we will know immediately whether a coarsening is working.");
-}
-
-// =====================================================================
-// 12. Literature review and bibliography  (NEW)
+// 13  Proposed approach
 // =====================================================================
 {
   const s = pres.addSlide();
   s.background = { color: WHITE };
-  title(s, "Literature review", "Three lines of work meet here: reasoning structure, chain compression, and graph reduction");
+  head(s, "Proposed Approach");
 
-  card(s, 0.75, 1.8, 5.85, 4.15, PAPER);
-  s.addText("Structured reasoning in LLMs", { x: 1.0, y: 1.97, w: 5.35, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 13.5, bold: true, color: VIOLET, margin: 0 });
-  [["Wei et al., 2022", "Chain-of-Thought Prompting Elicits Reasoning in LLMs. NeurIPS. arXiv:2201.11903", "Intermediate steps as computation"],
-   ["Wang et al., 2023", "Self-Consistency Improves Chain of Thought Reasoning. ICLR. arXiv:2203.11171", "Sample k chains, select the best"],
-   ["Yao et al., 2023", "Tree of Thoughts: Deliberate Problem Solving. NeurIPS. arXiv:2305.10601", "Branching and backtracking search"],
-   ["Besta et al., 2024", "Graph of Thoughts: Solving Elaborate Problems with LLMs. AAAI. arXiv:2308.09687", "Aggregation; our baseline"],
-   ["Zhang et al., 2024", "Multimodal Chain-of-Thought Reasoning. TMLR. arXiv:2302.00923", "Two-stage rationale then answer"],
-  ].forEach((r, i) => {
-    const y = 2.35 + i * 0.72;
-    s.addText(r[0], { x: 1.0, y, w: 5.35, h: 0.24, isTextBox: true, fontFace: BODY,
-      fontSize: 11.5, bold: true, color: INK, margin: 0 });
-    s.addText(r[1], { x: 1.0, y: y + 0.22, w: 5.35, h: 0.28, isTextBox: true,
-      fontFace: BODY, fontSize: 9.5, color: MUTE, margin: 0 });
-    s.addText(r[2], { x: 1.0, y: y + 0.44, w: 5.35, h: 0.24, isTextBox: true,
-      fontFace: BODY, fontSize: 9.5, italic: true, color: VIOLET, margin: 0 });
+  sub(s, "Transferring chain compression to a reasoning graph", 0.75, 1.3, 11.0);
+
+  tbl(s, ["Chain technique", "Graph analogue we propose", "Expected effect"], [
+    ["Chain of Draft", "Encode each vertex compactly - a sorted chunk as run-length pairs rather than a literal list", "Lossless here; ~6x fewer tokens per vertex"],
+    ["TokenSkip", "Ablate each vertex; drop those whose removal does not change the answer", "Reduces |V| directly"],
+    ["Coconut", "Aggregate in latent space - merge hidden states without decoding to text", "Removes decode cost at the 15 merge steps"],
+    ["Token budgeting", "Allocate k per vertex by measured difficulty rather than uniformly", "Spend where errors concentrate"],
+  ], 0.75, 1.72, 7.6, [1.7, 3.45, 2.45], undefined, 0.74, 9.5);
+
+  card(s, 0.75, 4.85, 7.6, 1.1, "FDF3E3");
+  s.addText("The causality constraint decides which of these are safe: an edge means one thought was literally the input that produced another, so every vertex on a path to the answer must retain one.",
+    { x: 1.0, y: 5.02, w: 7.1, h: 0.8, isTextBox: true, fontFace: F,
+      fontSize: 10, bold: true, color: INK, margin: 0 });
+
+  card(s, 8.65, 1.72, 3.95, 4.23, PAPER);
+  s.addText("Pipeline", { x: 8.9, y: 1.9, w: 3.45, h: 0.28, isTextBox: true,
+    fontFace: F, fontSize: 11.5, bold: true, color: BLUE, margin: 0 });
+  ["Instrument: per-vertex token cost and marginal contribution",
+   "Compress vertex content with a compact encoding",
+   "Coarsen: merge or drop low-contribution vertices",
+   "Verify reachability to the final thought is preserved",
+   "Evaluate against the ToT cost-quality frontier",
+  ].forEach((t, i) => {
+    const y = 2.32 + i * 0.7;
+    s.addShape(pres.ShapeType.ellipse, { x: 8.9, y, w: 0.29, h: 0.29,
+      fill: { color: i < 2 ? BLUE : AMBER }, line: { width: 0 } });
+    s.addText(String(i + 1), { x: 8.9, y: y + 0.03, w: 0.29, h: 0.24, isTextBox: true,
+      fontFace: F, fontSize: 9.5, bold: true, color: WHITE, align: "center", margin: 0 });
+    s.addText(t, { x: 9.3, y: y - 0.02, w: 3.05, h: 0.62, isTextBox: true,
+      fontFace: F, fontSize: 9, color: INK, margin: 0 });
   });
 
-  card(s, 6.95, 1.8, 5.65, 4.15, WHITE);
-  s.addText("Compression: of chains, and of graphs", { x: 7.2, y: 1.97, w: 5.15, h: 0.3,
-    isTextBox: true, fontFace: BODY, fontSize: 13.5, bold: true, color: AMBER, margin: 0 });
-  [["Xu et al., 2025", "Chain of Draft: Thinking Faster by Writing Less. arXiv:2502.18600", "Shorter steps; our Axis 1"],
-   ["Xia et al., 2025", "TokenSkip: Controllable Chain-of-Thought Compression. arXiv:2502.12067", "Token-level pruning of a chain"],
-   ["Hao et al., 2024", "Training LLMs to Reason in a Continuous Latent Space (Coconut). arXiv:2412.06769", "Latent thoughts, no text tokens"],
-   ["Sui et al., 2025", "Stop Overthinking: A Survey on Efficient Reasoning for LLMs. TMLR.", "Survey of the CoT-compression field"],
-   ["Loukas, 2019", "Graph Reduction with Spectral and Cut Guarantees. JMLR 20(116).", "Coarsening with provable bounds"],
-   ["Kwon et al., 2023", "Efficient Memory Management for LLM Serving with PagedAttention. SOSP. arXiv:2309.06180", "vLLM; our inference engine"],
-  ].forEach((r, i) => {
-    const y = 2.33 + i * 0.6;
-    s.addText(r[0], { x: 7.2, y, w: 5.15, h: 0.22, isTextBox: true, fontFace: BODY,
-      fontSize: 10.5, bold: true, color: INK, margin: 0 });
-    s.addText(r[1], { x: 7.2, y: y + 0.19, w: 5.15, h: 0.24, isTextBox: true,
-      fontFace: BODY, fontSize: 8.5, color: MUTE, margin: 0 });
-    s.addText(r[2], { x: 7.2, y: y + 0.37, w: 5.15, h: 0.2, isTextBox: true,
-      fontFace: BODY, fontSize: 8.5, italic: true, color: AMBER, margin: 0 });
+  card(s, 0.75, 6.1, 11.85, 0.7, "E8F4F1");
+  s.addText("Target, set by our own measurement:  reach error 7.45 at 2,185 tokens - where Tree of Thoughts sits today. Graph of Thoughts is currently at 8.28 error and 7,910 tokens.",
+    { x: 1.0, y: 6.24, w: 11.4, h: 0.44, isTextBox: true, fontFace: F,
+      fontSize: 10.5, bold: true, color: TEAL, margin: 0 });
+
+  s.addNotes("The run-length idea is worth dwelling on. For sorting, a chunk of sixty-four digits drawn from ten values compresses losslessly to roughly twenty tokens instead of a hundred and thirty. That is chain-of-draft applied to a graph vertex, and it costs nothing in accuracy because the encoding is exact.");
+}
+
+// =====================================================================
+// 14  Future Plan
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  head(s, "Future Plan");
+
+  bullets(s, [
+    "Complete the sweeps now running - aggregation attempts and chunk count across 32, 64 and 128 elements",
+    "Implement compact vertex encoding and measure its accuracy cost",
+    "Define the coarsening operator formally, with reachability to the final thought as the preserved invariant",
+    "Establish whether coarsening and vertex compression compose as predicted, or interact",
+    "Repeat at a larger model scale, to separate scale effects from structural ones",
+    "Extend beyond sorting to set intersection, where aggregation is a union rather than a merge",
+  ], 0.9, 1.5, 7.4, 4.3, 12.5);
+
+  card(s, 8.7, 1.5, 3.9, 4.6, PAPER);
+  s.addText("Open questions", { x: 8.95, y: 1.68, w: 3.4, h: 0.3, isTextBox: true,
+    fontFace: F, fontSize: 11.5, bold: true, color: BLUE, margin: 0 });
+  ["Does latent aggregation preserve causality in any meaningful sense, or dissolve the edge semantics entirely?",
+   "Is there a principled criterion for vertex removal, or must it be learned per task?",
+   "Does GoT's disadvantage at 7B close with scale, or is aggregation intrinsically fragile?",
+  ].forEach((q, i) => {
+    const y = 2.15 + i * 1.32;
+    s.addText(String(i + 1), { x: 8.95, y, w: 0.3, h: 0.3, isTextBox: true, fontFace: F,
+      fontSize: 12.5, bold: true, color: AMBER, margin: 0 });
+    s.addText(q, { x: 9.28, y, w: 3.07, h: 1.2, isTextBox: true, fontFace: F,
+      fontSize: 9.5, color: INK, margin: 0 });
   });
 
-  card(s, 7.2, 5.98, 5.15, 0.85, "FFF6E6");
-  s.addText("The gap: chain compression shrinks a step, and graph coarsening shrinks a data graph. Neither shrinks a reasoning graph whose edges carry causality.",
-    { x: 7.42, y: 6.1, w: 4.75, h: 0.62, isTextBox: true, fontFace: BODY,
-      fontSize: 9.5, bold: true, color: INK, margin: 0 });
+  s.addNotes("The third question is the one a committee is most likely to press on, and we should be candid that we cannot yet answer it - the 7B result may be a scale artefact.");
+}
 
-  s.addText("Code and full derivations:  github.com/TREX4096/Graph_of_Thought",
-    { x: 0.75, y: 6.25, w: 6.0, h: 0.3, isTextBox: true, fontFace: BODY,
-      fontSize: 10.5, color: MUTE, margin: 0 });
+// =====================================================================
+// 15  References
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  head(s, "References");
 
-  s.addNotes("The left column is the lineage we replicated. The right column is the toolkit we intend to borrow from. The gap statement is the contribution claim: spectral coarsening assumes edges encode similarity, whereas in a reasoning graph an edge means one thought was literally the input that produced another - so the guarantees have to be restated in terms of reachability to the answer.");
+  [
+    "[1] M. Besta, N. Blach, A. Kubicek, et al., \"Graph of Thoughts: Solving elaborate problems with large language models,\" in Proc. AAAI Conf. Artif. Intell., vol. 38, 2024, arXiv:2308.09687.",
+    "[2] S. Yao, D. Yu, J. Zhao, et al., \"Tree of Thoughts: Deliberate problem solving with large language models,\" in Adv. Neural Inf. Process. Syst. (NeurIPS), 2023, arXiv:2305.10601.",
+    "[3] J. Wei, X. Wang, D. Schuurmans, et al., \"Chain-of-thought prompting elicits reasoning in large language models,\" in Adv. Neural Inf. Process. Syst. (NeurIPS), 2022, arXiv:2201.11903.",
+    "[4] X. Wang, J. Wei, D. Schuurmans, et al., \"Self-consistency improves chain of thought reasoning in language models,\" in Proc. Int. Conf. Learn. Represent. (ICLR), 2023, arXiv:2203.11171.",
+    "[5] S. Xu, W. Xie, L. Zhao, and P. He, \"Chain of Draft: Thinking faster by writing less,\" 2025, arXiv:2502.18600.",
+    "[6] H. Xia, Y. Li, C. T. Leong, et al., \"TokenSkip: Controllable chain-of-thought compression in LLMs,\" 2025, arXiv:2502.12067.",
+    "[7] S. Hao, S. Sukhbaatar, D. Su, et al., \"Training large language models to reason in a continuous latent space,\" 2024, arXiv:2412.06769.",
+    "[8] A. Loukas, \"Graph reduction with spectral and cut guarantees,\" J. Mach. Learn. Res., vol. 20, no. 116, pp. 1-42, 2019.",
+    "[9] W. Kwon, Z. Li, S. Zhuang, et al., \"Efficient memory management for large language model serving with PagedAttention,\" in Proc. ACM SOSP, 2023, arXiv:2309.06180.",
+  ].forEach((r, i) => {
+    s.addText(r, { x: 0.8, y: 1.32 + i * 0.585, w: 11.6, h: 0.55, isTextBox: true,
+      fontFace: F, fontSize: 9, color: INK, margin: 0, lineSpacingMultiple: 1.1 });
+  });
+
+  s.addNotes("Items 1 to 4 are the reasoning-structure lineage we replicated; 5 to 7 are the chain-compression methods we intend to transfer; 8 and 9 are the graph-reduction theory and the serving infrastructure.");
+}
+
+// =====================================================================
+// 16  Thank You
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  corner(s);
+  brand(s, true);
+  s.addShape(pres.ShapeType.roundRect, { x: 2.8, y: 2.45, w: 7.7, h: 2.5,
+    rectRadius: 0.06, fill: { color: WHITE }, line: { color: INK, width: 1.2 } });
+  s.addText("Thank You", { x: 2.8, y: 3.2, w: 7.7, h: 1.0, isTextBox: true,
+    fontFace: F, fontSize: 44, bold: true, color: BLUE, align: "center", margin: 0 });
+  s.addText("github.com/TREX4096/Graph_of_Thought", { x: 2.8, y: 5.25, w: 7.7, h: 0.32,
+    isTextBox: true, fontFace: F, fontSize: 10.5, color: MUTE, align: "center", margin: 0 });
+  s.addNotes("Questions.");
 }
 
 pres.writeFile({ fileName: process.argv[2] || "deck.pptx" })
