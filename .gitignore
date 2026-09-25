@@ -8,3 +8,16 @@ models/
 
 # personal project brief - not for publication
 INSTRUCTION.md
+
+# --- secrets -----------------------------------------------------------
+# This repository is PUBLIC. Never commit credentials, keys or auth files.
+# Keep them in ~/.ssh/config, a password manager, or files matched below.
+proxyAuth.txt
+*.local.sh
+*.secret
+.env
+.env.*
+id_rsa*
+id_ed25519*
+*.pem
+*.key
