@@ -193,6 +193,16 @@ tmux kill-session -t got            # stop
 It finishes by running the paper comparison automatically. Single runs too:
 `bash scripts/run_tmux.sh R1`.
 
+> **Don't scroll tmux with arrow keys.** Nothing in that pane reads stdin, so keystrokes
+> get echoed raw and you end up with a screen of `^[[B`. Every run is `tee`d to its own
+> logfile — read those instead:
+> ```bash
+> tail -f results/matrix_*/R1_sorting_64.log     # live
+> less  results/matrix_*/R1_sorting_64.log       # scrollable
+> ```
+> If you do need the pane's scrollback: `Ctrl-b` then `[`, then `q` to exit. And if your
+> terminal ever stops echoing what you type, `stty sane` fixes it.
+
 ### Scoring your results against the paper
 
 ```bash

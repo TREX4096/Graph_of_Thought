@@ -50,7 +50,13 @@ PAPER_STRUCTURE: Dict[str, Dict[str, Any]] = {
     "io":     {"volume": 1.0,  "latency": 1.0, "aggregates": False},
     "cot":    {"volume": 2.0,  "latency": 2.0, "aggregates": False},
     "cot_sc": {"volume": 2.0,  "latency": 2.0, "aggregates": False},
-    "tot":    {"volume": 6.0,  "latency": 6.0, "aggregates": False},
+    # ToT's graph specifies 6, but its measured value is a FLOOR, not a
+    # constant: when a refinement round is rejected in favour of the incumbent
+    # that rewrite is genuinely not on the answer's path, so the realised
+    # latency is shorter. A model whose rewrites rarely help therefore reports
+    # ~4-5 legitimately. What must hold is that ToT ran multiple levels at all
+    # (latency >> 1) and that volume tracks latency (it is a tree).
+    "tot":    {"volume": 4.0,  "latency": 4.0, "aggregates": False},
     # With the final corrective pass the GoT graph gains one level, so the
     # measured figures are ~19.9 / ~8.8 rather than the bare 18 / 7.
     "got":    {"volume": 18.0, "latency": 7.0, "aggregates": True},

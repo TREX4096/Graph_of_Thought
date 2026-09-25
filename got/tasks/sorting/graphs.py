@@ -307,6 +307,21 @@ def cot_goo(numbers: List[int], refine_rounds: int = 1) -> List[Operation]:
     A chain of thoughts, i.e. Figure 1(b). We model the "intermediate
     reasoning step" as a self-refinement pass, which keeps the comparison
     fair: CoT gets more than one LLM call, just no branching.
+
+    Deliberately NOT given a KeepBest
+    ---------------------------------
+    ToT and GoT score the refinement against the thought it came from and keep
+    the better one. CoT does not, and must not: a chain has no selection
+    mechanism by definition -- that is exactly what CoT-SC was invented to add.
+    Giving this baseline a ranking step would make it something other than CoT.
+
+    The consequence is visible in the results and is worth reporting rather
+    than engineering away: on a 7B model this scheme scores *worse than plain
+    IO*, because a blind rewrite degrades the answer more often than it
+    improves it. That is the cleanest demonstration in the whole benchmark of
+    why scoring and selection -- not extra calls -- are what make the later
+    schemes work. Extra computation without a way to reject bad results is not
+    merely wasted, it is actively harmful.
     """
     root = InputOp({"current": list(numbers), "original": list(numbers)}, name="Input")
     budget = token_budget(len(numbers))
@@ -381,6 +396,19 @@ def tot_goo(
     current.add_predecessor(sc)
 
     # Each additional level is a refine-and-prune round.
+    #
+    # The incumbent is scored alongside the refinement, so KeepBest can reject
+    # a refinement that made things worse. Omitting it (an earlier version did)
+    # is wrong twice over: it handicaps the baseline in precisely the
+    # comparison GoT's headline claim rests on, and it is unfaithful to ToT,
+    # whose defining component is a state evaluator that prunes bad states.
+    # Measured effect: without this, ToT scored *worse than plain IO* --
+    # a blind rewrite degrades more often than it improves.
+    #
+    # Note this makes the ToT graph's in-degree > 1 at Score, which looks like
+    # aggregation but is not: no thought is ever *combined* with another, only
+    # ranked against it. Aggregation merges content; this merely selects. The
+    # reported n_aggregations stays 0, which is the honest reading.
     for level in range(1, depth):
         imp = Improve(prompt_name="improve", rounds=1, name=f"Refine{level}",
                       max_tokens=budget, stop=SORT_STOP)
@@ -388,6 +416,7 @@ def tot_goo(
 
         sc_l = Score(scoring_fn=sorting_score, name=f"Score{level}")
         sc_l.add_predecessor(imp)
+        sc_l.add_predecessor(current)      # incumbent competes
 
         keep_l = KeepBest(n=beam_width, name=f"KeepBest{level}")
         keep_l.add_predecessor(sc_l)

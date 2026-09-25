@@ -1,0 +1,35 @@
+# Line-ending policy.
+#
+# This repo is edited on Windows (core.autocrlf=true) and executed on a Linux
+# GPU server. Without an explicit policy a shell script can reach the server
+# with CRLF endings, where bash fails on the invisible carriage return:
+#
+#     ./run.sh: line 2: $'\r': command not found
+#
+# Pinning eol=lf on everything executable removes that entire class of bug,
+# regardless of what each contributor's autocrlf happens to be set to.
+
+# Normalise all text files in the repository to LF.
+* text=auto eol=lf
+
+# Scripts that run on Linux MUST be LF, no exceptions.
+*.sh      text eol=lf
+*.bash    text eol=lf
+*.sbatch  text eol=lf
+*.py      text eol=lf
+
+# Windows-only helpers keep CRLF, since that is what cmd.exe expects.
+*.bat     text eol=crlf
+*.ps1     text eol=crlf
+
+# Never touch binaries -- newline conversion corrupts them.
+*.pdf     binary
+*.png     binary
+*.jpg     binary
+*.gguf    binary
+*.safetensors binary
+
+# Datasets are text, but keep diffs readable rather than exploding on every
+# regenerate: they are large and machine-generated.
+*.csv     text eol=lf diff
+*.json    text eol=lf diff

@@ -168,3 +168,49 @@ def test_refinement_scores_the_incumbent_alongside_candidates():
     pred_names = {p.name for p in score_refine.predecessors}
     assert any("Refine" in n for n in pred_names)
     assert any("KeepBestMerge" in n for n in pred_names), "incumbent must compete"
+
+
+def test_tot_refinement_can_reject_a_worse_rewrite():
+    """ToT's state evaluator must be able to prune a bad refinement.
+
+    Without the incumbent wired into Score, KeepBest ranks only the rewrite and
+    is forced to accept it even when it is worse -- which measured *below the
+    IO baseline* on a real model. It also contradicts ToT's definition, whose
+    defining component is a state evaluator that prunes.
+    """
+    from got.tasks.sorting.graphs import tot_goo
+
+    leaves = tot_goo(list(range(32)), branching_factor=3, depth=3)
+    stack, seen, checked = list(leaves), set(), 0
+    while stack:
+        op = stack.pop()
+        if id(op) in seen:
+            continue
+        seen.add(id(op))
+        if op.name.startswith("Score") and op.name != "Score0":
+            assert len(op.predecessors) == 2, (
+                f"{op.name} must rank the rewrite against the incumbent"
+            )
+            checked += 1
+        stack.extend(op.predecessors)
+    assert checked >= 1, "expected at least one refinement level to check"
+
+
+def test_tot_still_reports_no_aggregation():
+    """Ranking two inputs is not aggregating them.
+
+    The fix above gives ToT's Score an in-degree of 2, which must NOT be
+    mistaken for aggregation: no thought is ever combined with another, only
+    ranked against it. If this ever flips, the GoT-vs-ToT structural claim
+    becomes meaningless.
+    """
+    from got.controller import Controller
+    from got.backends import get_backend
+    from got.tasks.sorting import SortingParser, SortingPrompter
+    from got.tasks.sorting.graphs import tot_goo
+
+    lm = get_backend("mock", seed=0)
+    ctrl = Controller(lm, SortingPrompter(), SortingParser(),
+                      tot_goo(list(range(32)), branching_factor=3, depth=3))
+    ctrl.run(num_chunks=4)
+    assert ctrl.graph_summary()["n_aggregations"] == 0, "ToT must stay a tree"

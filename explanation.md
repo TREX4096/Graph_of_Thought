@@ -1492,6 +1492,59 @@ parse failures exceed 30% or measured latency falls below what the graph specifi
 checks are the first thing to read in any result table
 ([§22.2](#222-before-you-run-anything-verify-the-pipeline-is-not-broken)).
 
+
+### Bug 6 — the ToT baseline was handicapped, inflating GoT's margin ★
+
+**Symptom:** the first *healthy* real-model run (parse rate clean, all structural
+checks passing) reported the error ordering
+
+```
+got 8.11  <  cot_sc  <  io  <  tot  <  cot
+```
+
+GoT won, which is the paper's claim — but **ToT and CoT both scored worse than plain
+IO.** A scheme that does strictly more work than IO, with an exact scorer available to
+it, has no business losing to IO.
+
+**Cause:** in `tot_goo`, each refinement level wired `Score` to the `Improve` operation
+*only*:
+
+```python
+sc_l.add_predecessor(imp)          # the rewrite
+# ...and nothing else
+```
+
+so `KeepBest` ranked the rewrite against nothing and was forced to accept it, even when
+it was worse. Since a blind rewrite degrades more often than it improves, ToT walked
+*downhill* at every level.
+
+**Why it is the worst kind of bug:** it does not crash, it does not look wrong, and it
+biases the result in the direction the experimenter is hoping for. GoT had already been
+given the incumbent-competes treatment ([§21.5](#215-how-the-official-repo-differs-from-ours));
+ToT had not. Every extra point of GoT's margin over ToT came from a defect in the
+baseline rather than from aggregation.
+
+**Fix:** `sc_l.add_predecessor(current)` — rank the rewrite against the thought it came
+from. This is also *more faithful* to ToT, not less: the defining component of ToT is a
+state evaluator that prunes bad states, and a ToT that cannot reject a bad rewrite is
+not ToT.
+
+**Effect:** ToT moved from below IO to solidly second, and GoT's measured advantage fell
+to an honest figure. Its latency also fell slightly (6.0 → ~5.3), which is correct — a
+rejected rewrite is genuinely not on the answer's path — so the structural check for ToT
+is now a floor rather than a constant.
+
+**CoT was deliberately left alone.** A chain has no selection mechanism by definition —
+adding one would make it CoT-SC. Its degradation under blind refinement stays in the
+results as a finding, and it is the cleanest demonstration in the benchmark of the real
+lesson: **extra computation without a way to reject bad results is not merely wasted, it
+is actively harmful.** That is what scoring buys you, and it is why every scheme above
+CoT has a ranking step.
+
+**Lesson:** audit your *baselines* at least as hard as your method. A result that favours
+your hypothesis is the one you should distrust most, and "the baseline loses to the
+trivial control" is the signal that it is broken.
+
 ---
 
 ## 16. What I verified, and what I did not
@@ -2878,6 +2931,14 @@ produced output, token counts, volume and latency) and a summary JSON.
 | `subhanu is not in the sudoers file` | no root, as expected | you never need root — see [§20.0](#200-nothing-in-this-project-requires-root) |
 | Run dies when you close SSH | no scheduler holding the job | `bash scripts/run_direct.sh --bg`, or use tmux |
 | `CUDA out of memory` but your model is small | **someone else is on that GPU** | `nvidia-smi`, then pick a free card with `CUDA_VISIBLE_DEVICES` |
+| tmux pane fills with `^[[B` / `^[[A` | arrow keys typed into a pane where nothing reads stdin: the tty echoes them but no process consumes them | `Ctrl-c`, Enter, `clear`. To scroll use copy mode (`Ctrl-b` `[`, then `q`) — **not** arrow keys. Better still, read `results/matrix_*/<run>.log` |
+| terminal stops echoing what you type | a run exited without restoring the tty | `stty sane` then Enter, or `reset` |
+| `$'\r': command not found` | script saved with Windows CRLF line endings | `sed -i 's/\r$//' script.sh`, and set `git config --global core.autocrlf input` |
+
+**On scrolling tmux at all:** mostly you should not need to. Every run in the matrix is
+`tee`d to its own logfile, so `less results/matrix_*/R1_sorting_64.log` or
+`tail -f results/matrix_*/R1_sorting_64.log` gives you the same output in a pager that
+scrolls normally. Use tmux to keep the job *alive*, not to read it.
 
 ### 20.2 Etiquette that will save you
 
@@ -3324,6 +3385,7 @@ That is a more interesting paragraph than a confirmation.
 |---|---|---|
 | Different model from the paper | unavoidable | stated explicitly; claims tested are relative |
 | Our ToT baseline is leaner than theirs | **open** | run their ToT/ToT2 configs ($k$, $L$ varied) for a fair cost comparison |
+| ~~ToT could not reject a bad refinement~~ | **closed** | fixed; see Bug 6. It had inflated GoT's margin |
 | Prompts differ (ours are terser) | deliberate | documented in [§14.6](#146-defensive-parsing); small models need format-strict prompts |
 | ~~Post-merge refinement missing~~ | **closed** | added as `--refine-attempts` (default 10), with the incumbent scored alongside the candidates so the pass is monotone |
 | Temperature 1.0 → run-to-run variance | inherent | 100 instances; report variance, not just means |

@@ -268,6 +268,7 @@ def tot_intersection_goo(
 
         sc_l = Score(scoring_fn=intersection_score, name=f"Score{level}")
         sc_l.add_predecessor(imp)
+        sc_l.add_predecessor(current)      # incumbent competes; see sorting
 
         keep_l = KeepBest(n=beam_width, name=f"KeepBest{level}")
         keep_l.add_predecessor(sc_l)
