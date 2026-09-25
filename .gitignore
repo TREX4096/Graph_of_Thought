@@ -24,3 +24,4 @@ id_ed25519*
 
 # transient git bundles used to ship commits over SSH when the proxy is down
 *.bundle
+docs/~$*
