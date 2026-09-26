@@ -1,11 +1,16 @@
 # Deck assets
 
-Drop the Department of Electrical Engineering / IIT Delhi logo here as:
+The title and header logo is picked up automatically from the first of
+these that exists:
 
-    iitd_ee_logo.png
+    docs/IITD-_logo.png          <- currently in use
+    docs/assets/iitd_ee_logo.png
+    docs/assets/logo.png
 
-`make_deck.js` detects it automatically and places it on the title slide,
-every content slide header, and the closing slide. Without it the deck falls
-back to a plain text lockup, so the build never breaks.
+Without any of them the deck falls back to a text lockup, so the build
+never breaks.
 
-PNG with a transparent background works best; roughly 600 px wide is plenty.
+The IIT Delhi crest is square (220x220 with transparency), and every
+placement in `make_deck.js` uses a 1:1 box for that reason. If you swap in
+a wide departmental lockup instead, change `d0` in `brand()` and the width
+in `head()` to match its aspect ratio - a square box would squash it.

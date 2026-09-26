@@ -36,17 +36,20 @@ pres.author = "Prasoon Raj, Nikhil Bansal";
 pres.title  = "Causality-Preserving Graph Coarsening for Efficient LLM Reasoning";
 
 // --- logo, if supplied ------------------------------------------------
-const LOGO = ["docs/assets/iitd_ee_logo.png", "docs/assets/logo.png",
-              "assets/iitd_ee_logo.png"]
+// The IIT Delhi crest is square (220x220), so every placement below uses a
+// 1:1 box. A wide box with sizing:contain would letterbox it and leave the
+// mark floating off-centre inside its own frame.
+const LOGO = ["docs/IITD-_logo.png", "docs/assets/iitd_ee_logo.png",
+              "docs/assets/logo.png", "assets/iitd_ee_logo.png"]
   .map(p => path.resolve(__dirname, "..", p))
   .find(p => fs.existsSync(p));
-if (!LOGO) console.warn("note: no logo found at docs/assets/iitd_ee_logo.png - using text lockup");
+if (!LOGO) console.warn("note: no logo found - falling back to a text lockup");
+else console.log("logo:", path.relative(path.resolve(__dirname, ".."), LOGO));
 
 function brand(s, big) {
   if (LOGO) {
-    s.addImage({ path: LOGO, x: 0.55, y: 0.2, w: big ? 1.5 : 1.0,
-                 h: big ? 0.75 : 0.5, sizing: { type: "contain",
-                 w: big ? 1.5 : 1.0, h: big ? 0.75 : 0.5 } });
+    const d0 = big ? 0.92 : 0.58;                 // square: crest is 1:1
+    s.addImage({ path: LOGO, x: 0.58, y: big ? 0.14 : 0.2, w: d0, h: d0 });
   } else if (big) {
     s.addText("IIT DELHI", { x: 0.55, y: 0.24, w: 2.6, h: 0.3, isTextBox: true,
       fontFace: F, fontSize: 14, bold: true, color: BLUE, charSpacing: 2, margin: 0 });
@@ -68,8 +71,7 @@ function corner(s) {
 }
 function head(s, text) {
   corner(s);
-  if (LOGO) s.addImage({ path: LOGO, x: 11.75, y: 0.72, w: 1.0, h: 0.5,
-                         sizing: { type: "contain", w: 1.0, h: 0.5 } });
+  if (LOGO) s.addImage({ path: LOGO, x: 12.02, y: 0.72, w: 0.62, h: 0.62 });
   s.addText(text, { x: 0.62, y: 0.26, w: W - 3.4, h: 0.66, isTextBox: true,
     fontFace: F, fontSize: 30, bold: true, color: BLUE, margin: 0 });
   const rw = Math.min(6.6, 0.30 * text.length + 1.1);
