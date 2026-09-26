@@ -1,5 +1,5 @@
 // Causality-Preserving Graph Coarsening for Efficient LLM Reasoning
-// Mid-Term Review deck. Academic format, Montserrat throughout.
+// Mid-Term Review deck. 18 slides, academic format, Montserrat throughout.
 //
 // FONT: Montserrat is NOT bundled with Office. Install it on the presenting
 // machine (fonts.google.com/specimen/Montserrat) or embed it via
@@ -157,6 +157,56 @@ function tbl(s, header, rows, x, y, w, colW, hi, rowH, fs) {
 }
 
 // =====================================================================
+// 1b  Motivation and project overview
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  head(s, "Motivation");
+
+  sub(s, "Why reasoning cost is now the binding constraint", 0.75, 1.3, 7.3);
+  bullets(s, [
+    "Accuracy on hard tasks is increasingly bought at inference time, by making the model generate more - not by making it larger.",
+    "Every generated token is one forward pass through the network. Tokens are simultaneously latency, energy and money.",
+    "Graph of Thoughts is the most capable reasoning structure published, because it can merge separate lines of reasoning.",
+    "It is also the most expensive we measured - 15x direct prompting. A capability nobody can afford is not a capability.",
+  ], 0.75, 1.78, 7.3, 2.9, 13.5);
+
+  card(s, 0.75, 4.95, 7.3, 1.35, "FDF3E3");
+  s.addText("This project asks a simple question: how much of that graph is actually necessary ?",
+    { x: 1.0, y: 5.18, w: 6.85, h: 0.9, isTextBox: true, fontFace: F,
+      fontSize: 14, bold: true, color: AMBER, margin: 0 });
+
+  // Three-phase overview, with status
+  card(s, 8.45, 1.3, 4.15, 5.0, PAPER);
+  s.addText("The project in three phases", { x: 8.75, y: 1.5, w: 3.6, h: 0.3,
+    isTextBox: true, fontFace: F, fontSize: 13, bold: true, color: BLUE, margin: 0 });
+
+  const ph = [
+    ["1", "REPLICATE", "Rebuild Graph of Thoughts and all four baselines on one engine, on open models", TEAL, "done"],
+    ["2", "MEASURE", "Establish what is true, and locate where the cost actually accumulates", TEAL, "done"],
+    ["3", "COMPRESS", "Shrink the graph without breaking the causal paths that carry the answer", AMBER, "current"],
+  ];
+  ph.forEach((p, i) => {
+    const y = 2.0 + i * 1.45;
+    s.addShape(pres.ShapeType.ellipse, { x: 8.78, y, w: 0.4, h: 0.4,
+      fill: { color: p[3] }, line: { width: 0 } });
+    s.addText(p[0], { x: 8.78, y: y + 0.04, w: 0.4, h: 0.32, isTextBox: true,
+      fontFace: F, fontSize: 13, bold: true, color: WHITE, align: "center", margin: 0 });
+    s.addText(p[1], { x: 9.3, y: y + 0.02, w: 2.0, h: 0.3, isTextBox: true,
+      fontFace: F, fontSize: 12.5, bold: true, color: p[3], margin: 0 });
+    s.addText(p[4], { x: 11.2, y: y + 0.04, w: 1.15, h: 0.26, isTextBox: true,
+      fontFace: F, fontSize: 10, bold: true, color: p[3], align: "right", margin: 0 });
+    s.addText(p[2], { x: 9.3, y: y + 0.38, w: 3.05, h: 0.85, isTextBox: true,
+      fontFace: F, fontSize: 11, color: INK, margin: 0 });
+    if (i < 2) s.addShape(pres.ShapeType.line, { x: 8.98, y: y + 0.45, w: 0, h: 0.95,
+      line: { color: "C6CEE2", width: 1.4 } });
+  });
+
+  s.addNotes("SCRIPT  (~60 sec)\n\nA short word on why this problem is worth working on.\n\nFor the last two years, accuracy on hard tasks has increasingly been bought at inference time - by making the model generate more, rather than by making the model bigger. That shift is what makes this a cost problem. Every token the model generates is one forward pass through the whole network, so tokens are latency, energy and money all at once.\n\nGraph of Thoughts is the most capable reasoning structure published, because it is the only one that can merge two separate lines of reasoning. It is also, in our measurements, the most expensive - fifteen times the cost of just asking the question directly. And a capability that nobody can afford to run is not really a capability.\n\nSo the project asks one question: how much of that graph is actually necessary?\n\nWe approach it in three phases, on the right. First replicate - rebuild Graph of Thoughts and all four baselines on a single engine so the comparison is fair. Second measure - establish what is actually true, and find where the cost accumulates. Those two are complete. Third, compress - which is where we are now.\n\n---\nTRANSITION: That gives us the problem statement.\nCUE: the three-phase panel is the map for the whole talk - point at it.");
+}
+
+// =====================================================================
 // 2  Problem Statement
 // =====================================================================
 {
@@ -233,7 +283,7 @@ function tbl(s, header, rows, x, y, w, colW, hi, rowH, fs) {
     isTextBox: true, fontFace: F, fontSize: 9.5, italic: true, color: MUTE, margin: 0 });
 
   cite(s, "Wei et al., NeurIPS 2022, arXiv:2201.11903");
-  s.addNotes("SCRIPT  (~45 sec)\n\nChain-of-Thought is the foundation. You add worked examples to the prompt showing intermediate steps, and the model imitates that - with no change to the weights at all. So this is purely inference-time, which is true of everything in this project.\n\nThe key insight is that the chain is not the model explaining itself afterwards. The chain IS the computation. A model does one forward pass per token, so a one-token answer gets one token's worth of thinking no matter how hard the question. Fifty reasoning tokens gets fifty forward passes.\n\nAnd it works: GSM8K goes from eighteen percent to fifty-seven percent on PaLM-540B. That beat a fine-tuned model with a verifier, by prompting alone.\n\nOne caveat that matters for our results later. The ability is emergent. Below roughly ten billion parameters the chains are fluent but logically invalid, and accuracy can drop below direct prompting. We are running a 7B model, so we will come back to this.\n\nThe structural limitation is on the right. One path, each step with a single parent. Once a step is wrong, everything after it is conditioned on that error - there is no way to back out.\n\n---\nTRANSITION: That is what Tree of Thoughts addresses.\nCUE: the emergence bullet is load-bearing - it explains CoT scoring below IO on slide 11.");
+  s.addNotes("SCRIPT  (~45 sec)\n\nChain-of-Thought is the foundation. You add worked examples to the prompt showing intermediate steps, and the model imitates that - with no change to the weights at all. So this is purely inference-time, which is true of everything in this project.\n\nThe key insight is that the chain is not the model explaining itself afterwards. The chain IS the computation. A model does one forward pass per token, so a one-token answer gets one token's worth of thinking no matter how hard the question. Fifty reasoning tokens gets fifty forward passes.\n\nAnd it works: GSM8K goes from eighteen percent to fifty-seven percent on PaLM-540B. That beat a fine-tuned model with a verifier, by prompting alone.\n\nOne caveat that matters for our results later. The ability is emergent. Below roughly ten billion parameters the chains are fluent but logically invalid, and accuracy can drop below direct prompting. We are running a 7B model, so we will come back to this.\n\nThe structural limitation is on the right. One path, each step with a single parent. Once a step is wrong, everything after it is conditioned on that error - there is no way to back out.\n\n---\nTRANSITION: That is what Tree of Thoughts addresses.\nCUE: the emergence bullet is load-bearing - it explains CoT scoring below IO on slide 12.");
 }
 
 // =====================================================================
@@ -312,7 +362,7 @@ function tbl(s, header, rows, x, y, w, colW, hi, rowH, fs) {
     isTextBox: true, fontFace: F, fontSize: 13, color: INK, align: "center", margin: 0 });
 
   cite(s, "Besta et al., AAAI 2024, arXiv:2308.09687");
-  s.addNotes("SCRIPT  (~50 sec)\n\nGraph of Thoughts models reasoning as a directed graph. Vertices are thoughts, and an edge means one thought's text was the direct input that produced another. So edges encode causality, not similarity - and that definition is what our whole method has to respect.\n\nThe contribution is aggregation: merging k thoughts into one. That creates a vertex with in-degree greater than one, and a tree cannot contain one by definition. So this is a structural result, not a design preference.\n\nFor sorting it runs merge sort with the model as the primitive - split into chunks, sort each chunk, then merge pairwise back up. Sorting sixteen numbers is reliable, and merging two sorted lists is reliable. Sorting sixty-four from scratch is not. So you only ever perform the reliable operations.\n\nThe theoretical result is volume N at latency log N. It is the only scheme where every computed thought keeps a causal path to the answer - a tree discards nearly all of what it computes.\n\nAnd the reported gain was sixty-two percent over Tree of Thoughts on ChatGPT-3.5, with a thirty-one percent cost reduction. That is the claim we set out to test.\n\n---\nTRANSITION: And this is the object we want to compress.\nCUE: point at the amber merge edges when saying 'in-degree greater than one'.\nDO NOT oversell the 62% - we report on slide 11 that it does not reproduce.");
+  s.addNotes("SCRIPT  (~50 sec)\n\nGraph of Thoughts models reasoning as a directed graph. Vertices are thoughts, and an edge means one thought's text was the direct input that produced another. So edges encode causality, not similarity - and that definition is what our whole method has to respect.\n\nThe contribution is aggregation: merging k thoughts into one. That creates a vertex with in-degree greater than one, and a tree cannot contain one by definition. So this is a structural result, not a design preference.\n\nFor sorting it runs merge sort with the model as the primitive - split into chunks, sort each chunk, then merge pairwise back up. Sorting sixteen numbers is reliable, and merging two sorted lists is reliable. Sorting sixty-four from scratch is not. So you only ever perform the reliable operations.\n\nThe theoretical result is volume N at latency log N. It is the only scheme where every computed thought keeps a causal path to the answer - a tree discards nearly all of what it computes.\n\nAnd the reported gain was sixty-two percent over Tree of Thoughts on ChatGPT-3.5, with a thirty-one percent cost reduction. That is the claim we set out to test.\n\n---\nTRANSITION: And this is the object we want to compress.\nCUE: point at the amber merge edges when saying 'in-degree greater than one'.\nDO NOT oversell the 62% - we report on slide 12 that it does not reproduce.");
 }
 
 // =====================================================================
@@ -639,6 +689,63 @@ function tbl(s, header, rows, x, y, w, colW, hi, rowH, fs) {
       fontSize: 12.5, bold: true, color: AMBER, margin: 0 });
 
   s.addNotes("The right panel is the useful diagnostic: cost is concentrated in aggregation, not in chunk sorting. That tells us where both compression axes should be aimed first.");
+}
+
+// =====================================================================
+// 12b  Challenges faced
+// =====================================================================
+{
+  const s = pres.addSlide();
+  s.background = { color: WHITE };
+  head(s, "Challenges Faced");
+
+  sub(s, "Two that changed the results, and three we worked around", 0.75, 1.3, 11.0);
+
+  card(s, 0.75, 1.75, 5.8, 2.15, "FBEBE9");
+  s.addText("1.  A pipeline that failed silently", { x: 1.0, y: 1.92, w: 5.3, h: 0.3,
+    isTextBox: true, fontFace: F, fontSize: 13, bold: true, color: ROSE, margin: 0 });
+  s.addText("A generation budget 32 tokens short truncated the answer, which removed the closing bracket, which failed the parser, which emptied the ranking step - and the graph stopped executing while still printing a full table of plausible numbers.",
+    { x: 1.0, y: 2.28, w: 5.3, h: 1.15, isTextBox: true, fontFace: F,
+      fontSize: 11.5, color: INK, margin: 0 });
+  s.addText("Cost one GPU run. Now guarded by a parse-rate check that fails loudly.",
+    { x: 1.0, y: 3.48, w: 5.3, h: 0.32, isTextBox: true, fontFace: F,
+      fontSize: 11, italic: true, color: MUTE, margin: 0 });
+
+  card(s, 0.75, 4.05, 5.8, 2.15, "FBEBE9");
+  s.addText("2.  Our own baseline was handicapped", { x: 1.0, y: 4.22, w: 5.3, h: 0.3,
+    isTextBox: true, fontFace: F, fontSize: 13, bold: true, color: ROSE, margin: 0 });
+  s.addText("Tree of Thoughts could not reject a refinement that made the answer worse, so it walked downhill at every level. That inflated Graph of Thoughts' apparent margin by roughly 18 points, in our favour.",
+    { x: 1.0, y: 4.58, w: 5.3, h: 1.05, isTextBox: true, fontFace: F,
+      fontSize: 11.5, color: INK, margin: 0 });
+  s.addText("Found by auditing a result that suited us. Fixing it reversed the finding.",
+    { x: 1.0, y: 5.72, w: 5.3, h: 0.35, isTextBox: true, fontFace: F,
+      fontSize: 11, italic: true, color: MUTE, margin: 0 });
+
+  card(s, 6.85, 1.75, 5.7, 4.45, PAPER);
+  s.addText("Worked around", { x: 7.1, y: 1.93, w: 5.2, h: 0.3, isTextBox: true,
+    fontFace: F, fontSize: 13, bold: true, color: BLUE, margin: 0 });
+  [["The reference model no longer exists",
+    "ChatGPT-3.5 is deprecated, so exact reproduction is impossible - for anyone, including the authors. We redefined the target as the paper's relative claims rather than its digits."],
+   ["Our model sits below the scale threshold",
+    "Chain-of-thought is reliable above roughly 10B parameters; we run 7B. Structural claims are unaffected, but absolute quality is not comparable to the paper."],
+   ["Shared, unscheduled infrastructure",
+    "A GPU server with no job scheduler, a proxy-gated network and a full disk. Runs are detached so they survive disconnection, and the environment is verified before any GPU time is spent."],
+  ].forEach((c, i) => {
+    const y = 2.35 + i * 1.32;
+    s.addShape(pres.ShapeType.ellipse, { x: 7.12, y: y + 0.05, w: 0.14, h: 0.14,
+      fill: { color: AMBER }, line: { width: 0 } });
+    s.addText(c[0], { x: 7.42, y, w: 4.9, h: 0.3, isTextBox: true, fontFace: F,
+      fontSize: 12, bold: true, color: INK, margin: 0 });
+    s.addText(c[1], { x: 7.42, y: y + 0.32, w: 4.9, h: 0.9, isTextBox: true,
+      fontFace: F, fontSize: 10.5, color: MUTE, margin: 0 });
+  });
+
+  card(s, 0.75, 6.35, 11.8, 0.7, "E8F4F1");
+  s.addText("The common lesson: a benchmark that cannot distinguish a weak model from a harness that did not run is worse than no benchmark, because it produces numbers you might publish.",
+    { x: 1.0, y: 6.48, w: 11.35, h: 0.45, isTextBox: true, fontFace: F,
+      fontSize: 11.5, bold: true, color: TEAL, margin: 0 });
+
+  s.addNotes("SCRIPT  (~60 sec)\n\nTwo problems changed our results, and both are worth reporting.\n\nThe first was a pipeline that failed silently. Our generation budget was thirty-two tokens short of what a sixty-four element answer needs. That truncated the output, which removed the closing bracket, which failed the parser, which emptied the ranking step - and the whole graph simply stopped executing, while still printing a complete table of plausible-looking numbers. Nothing raised an error. It cost us a full GPU run, and we only caught it because the volume and latency columns are structural and cannot change with model quality.\n\nThe second is more uncomfortable. Our own Tree of Thoughts baseline could not reject a refinement that made the answer worse, so it degraded at every level. That inflated Graph of Thoughts' apparent margin by about eighteen points - in the direction we were hoping for. We found it by auditing a result that suited us, and fixing it reversed the finding.\n\nOn the right are three we worked around rather than solved. The reference model is deprecated, so we redefined replication as the paper's relative claims. Our model is below the scale at which chain-of-thought is reliable. And the infrastructure is a shared GPU box with no scheduler and a proxy-gated network.\n\nThe common lesson is at the bottom: a benchmark that cannot distinguish a weak model from a harness that did not run is worse than no benchmark at all.\n\n---\nIF ASKED how you know the fix is right: the structural columns. A weak model gives bad answers, not a smaller graph. Tree of Thoughts was reporting 1.1 model calls against a plan specifying 3.\nDO NOT skip challenge 2 - auditing a result that favoured us is the strongest methodological point we have.");
 }
 
 // =====================================================================
