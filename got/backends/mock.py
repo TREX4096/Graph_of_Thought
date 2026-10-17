@@ -287,3 +287,73 @@ class MockLM(AbstractLanguageModel):
             out.append(str(self._corrupt(correct, rate)))
 
         return out
+
+    # ------------------------------------------------------------------
+    # Entropy support (for testing the step-entropy pipeline without a GPU)
+    # ------------------------------------------------------------------
+    def generate_with_entropy(
+        self,
+        prompts: Sequence[str],
+        max_tokens: Optional[int] = None,
+        stop: Optional[Sequence[str]] = None,
+        logprobs: int = 20,
+    ) -> List[Dict[str, object]]:
+        """Synthesise a multi-step chain with deliberately uneven entropy.
+
+        This is NOT a model and the entropies are not real. It exists so the
+        segmentation, measurement, selection and pruning path can be tested
+        end to end on a laptop -- the same reason MockLM exists at all.
+
+        The construction is adversarial on purpose: steps that carry the
+        arithmetic are given high entropy, and filler steps ("Let me
+        double-check that.") low entropy. A correct implementation of
+        low-entropy pruning must therefore keep the arithmetic and discard
+        the filler. If it does the opposite, the test fails loudly rather
+        than producing a plausible-looking number.
+        """
+        rng = self._rng
+        results = []
+        for p in prompts:
+            substantive = [
+                "First, identify what the question is asking for.",
+                "Set up the equation: 16 - 3 - 4 = 9 eggs remain.",
+                "Multiply the remainder by the price: 9 * 2 = 18.",
+                "So the final answer is 18.",
+            ]
+            filler = [
+                "Let me think about this step by step.",
+                "Okay, so I need to be careful here.",
+                "Let me double-check that calculation.",
+                "Hmm, wait. Let me reconsider.",
+                "That seems right to me.",
+            ]
+            steps, kinds = [], []
+            for i in range(max(len(substantive), len(filler))):
+                if i < len(filler):
+                    steps.append(filler[i]); kinds.append("filler")
+                if i < len(substantive):
+                    steps.append(substantive[i]); kinds.append("substantive")
+
+            text = "\n\n".join(steps)
+            # One pseudo-token per ~4 characters, matching real tokenisers.
+            token_texts, token_ents = [], []
+            for step, kind in zip(steps, kinds):
+                hi = kind == "substantive"
+                chunk = [step[i:i + 4] for i in range(0, len(step), 4)]
+                for piece in chunk:
+                    token_texts.append(piece)
+                    # bits/token: substantive ~3.5, filler ~0.4
+                    base = 3.5 if hi else 0.4
+                    token_ents.append(max(0.0, rng.gauss(base, 0.25)))
+                token_texts.append("\n\n")
+                token_ents.append(0.05)
+            self.usage.n_calls += 1
+            self.usage.completion_tokens += len(token_texts)
+            results.append({
+                "text": text,
+                "token_entropies": token_ents,
+                "token_texts": token_texts,
+                "n_tokens": len(token_texts),
+            })
+        self.usage.n_batches += 1
+        return results

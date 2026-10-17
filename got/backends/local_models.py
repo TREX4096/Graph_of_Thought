@@ -406,3 +406,62 @@ class VLLMLM(AbstractLanguageModel):
         )
         # vLLM preserves input order in its output list.
         return [[c.text.strip() for c in out.outputs] for out in outputs]
+
+    def generate_with_entropy(
+        self,
+        prompts,
+        max_tokens=None,
+        stop=None,
+        logprobs: int = 20,
+    ):
+        """One greedy-ish sample per prompt, with per-token entropy.
+
+        ``logprobs=k`` makes vLLM return the top-k log-probabilities at every
+        generated position. Entropy is computed over those k, renormalised -
+        see ``got/entropy.py`` on why that is a lower bound and why it is
+        still sufficient for ranking steps.
+
+        Requesting logprobs costs host memory proportional to
+        k * tokens * sequences, so keep k modest on long chains.
+        """
+        import math as _math
+        from .base import UsageStats  # noqa: F401  (kept for symmetry)
+        from ..entropy import token_entropy
+
+        params = self._SamplingParams(
+            n=1,
+            temperature=self.temperature,
+            max_tokens=max_tokens or self.max_tokens,
+            stop=list(stop) if stop else None,
+            logprobs=logprobs,
+        )
+        outputs = self._llm.generate(
+            [self._build_prompt(p) for p in prompts], params
+        )
+
+        results = []
+        for out in outputs:
+            c = out.outputs[0]
+            ents, texts = [], []
+            for pos, lp_dict in enumerate(c.logprobs or []):
+                # vLLM gives {token_id: Logprob}. Logprob objects carry
+                # .logprob and sometimes .decoded_token.
+                vals = []
+                for v in lp_dict.values():
+                    vals.append(getattr(v, "logprob", v) if not isinstance(v, float) else v)
+                ents.append(token_entropy(vals))
+                tid = c.token_ids[pos] if pos < len(c.token_ids) else None
+                texts.append(self._tokenizer.decode([tid]) if tid is not None else "")
+            # Account for the tokens this call consumed, like query() does.
+            self.usage.n_calls += 1
+            self.usage.n_batches += 0
+            self.usage.completion_tokens += len(c.token_ids)
+            self.usage.prompt_tokens += len(out.prompt_token_ids or [])
+            results.append({
+                "text": c.text,
+                "token_entropies": ents,
+                "token_texts": texts,
+                "n_tokens": len(c.token_ids),
+            })
+        self.usage.n_batches += 1
+        return results

@@ -182,6 +182,36 @@ class AbstractLanguageModel(abc.ABC):
         """
         raise NotImplementedError
 
+    def generate_with_entropy(
+        self,
+        prompts: Sequence[str],
+        max_tokens: Optional[int] = None,
+        stop: Optional[Sequence[str]] = None,
+        logprobs: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Generate, and return per-token entropy alongside the text.
+
+        Returns one dict per prompt::
+
+            {"text": str,
+             "token_entropies": [float, ...],   # bits, one per token
+             "token_texts": [str, ...]}         # for aligning to steps
+
+        Used by the step-entropy experiments (see ``got/entropy.py``). The
+        entropy is computed over the top-``logprobs`` of the next-token
+        distribution, renormalised - a serving engine does not expose the
+        full vocabulary, so this is a lower bound on true entropy. It is
+        adequate for *ranking* steps, which is all pruning needs.
+
+        Backends that cannot supply logprobs should raise, rather than
+        return zeros: a silent zero would make every step look equally
+        prunable and quietly invalidate the experiment.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot report token entropy. Use the vllm "
+            "or mock backend for entropy experiments."
+        )
+
     def _generate_batch(
         self,
         prompts: Sequence[str],

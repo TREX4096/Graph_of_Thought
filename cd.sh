@@ -45,7 +45,7 @@ update () {
 }
 
 # --- environment -----------------------------------------------------
-#     conda activate GOTComp-cu121
+#       
 #     pip install -e ".[hpc]"
 #     python scripts/generate_data.py --out data --seed 42 --n-samples 100 --small
 
