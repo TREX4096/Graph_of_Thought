@@ -27,10 +27,12 @@ from .scoring import answers_match, extract_answer, normalise_answer
 from .prompts import (
     ANSWER_ONLY_PROMPT,
     COT_PROMPT,
+    build_compressed_prefill,
     build_compressed_prompt,
 )
 
 __all__ = [
     "answers_match", "extract_answer", "normalise_answer",
-    "COT_PROMPT", "ANSWER_ONLY_PROMPT", "build_compressed_prompt",
+    "COT_PROMPT", "ANSWER_ONLY_PROMPT",
+    "build_compressed_prefill", "build_compressed_prompt",
 ]

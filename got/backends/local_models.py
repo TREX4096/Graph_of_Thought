@@ -362,16 +362,31 @@ class VLLMLM(AbstractLanguageModel):
     def _count_tokens(self, text: str) -> int:
         return len(self._tokenizer.encode(text))
 
-    def _build_prompt(self, prompt: str) -> str:
+    def _build_prompt(self, prompt: str, prefill: str = "") -> str:
+        """Render the chat template, optionally pre-filling the reply.
+
+        ``prefill`` is appended *after* the generation prompt, so the model
+        continues an assistant turn that has already begun rather than
+        answering a fresh user message.
+
+        This matters for reasoning models. A model trained to emit
+        <think>...</think> and then an answer behaves quite differently when
+        reasoning is handed to it inside a user message versus when it finds
+        that reasoning already present in its own turn - in the first case
+        the text is something to read, in the second it is something to
+        continue. Only the second matches how the model was trained, and the
+        step-entropy protocol depends on it.
+        """
         messages = [
             {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
         if getattr(self._tokenizer, "chat_template", None):
-            return self._tokenizer.apply_chat_template(
+            rendered = self._tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
-        return prompt
+            return rendered + prefill
+        return prompt + prefill
 
     def _generate(
         self,
@@ -413,6 +428,7 @@ class VLLMLM(AbstractLanguageModel):
         max_tokens=None,
         stop=None,
         logprobs: int = 20,
+        prefills=None,
     ):
         """One greedy-ish sample per prompt, with per-token entropy.
 
@@ -435,8 +451,11 @@ class VLLMLM(AbstractLanguageModel):
             stop=list(stop) if stop else None,
             logprobs=logprobs,
         )
+        pf = list(prefills) if prefills is not None else [""] * len(prompts)
+        if len(pf) != len(prompts):
+            raise ValueError("prefills must align 1:1 with prompts")
         outputs = self._llm.generate(
-            [self._build_prompt(p) for p in prompts], params
+            [self._build_prompt(p, q) for p, q in zip(prompts, pf)], params
         )
 
         results = []

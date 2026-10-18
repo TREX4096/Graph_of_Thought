@@ -188,6 +188,7 @@ class AbstractLanguageModel(abc.ABC):
         max_tokens: Optional[int] = None,
         stop: Optional[Sequence[str]] = None,
         logprobs: int = 20,
+        prefills: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Generate, and return per-token entropy alongside the text.
 

@@ -64,7 +64,7 @@ from got.tasks.math_reasoning import (
     ANSWER_ONLY_PROMPT,
     COT_PROMPT,
     answers_match,
-    build_compressed_prompt,
+    build_compressed_prefill,
     extract_answer,
 )
 
@@ -108,6 +108,14 @@ def main() -> None:
                     help="top-k for the entropy estimate; higher is tighter")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--batch", type=int, default=32)
+    # Reasoning models (DeepSeek-R1) emit <think>...</think>; instruct models
+    # (Qwen2.5) never do, and wrapping their prefill in tags they have never
+    # seen is its own distribution shift. Default on, since the paper's models
+    # are reasoning models.
+    ap.add_argument("--think-tags", dest="think_tags", action="store_true",
+                    default=True, help="wrap the pruned chain in <think> tags")
+    ap.add_argument("--no-think-tags", dest="think_tags", action="store_false",
+                    help="prefill the chain without think tags (instruct models)")
     args = ap.parse_args()
 
     with open(args.data, newline="", encoding="utf-8") as fh:
@@ -175,13 +183,19 @@ def main() -> None:
             for i in tqdm(range(0, len(chains), args.batch),
                           desc=f"  {strat:<6} r={ratio}", unit="batch"):
                 chunk = chains[i: i + args.batch]
-                prompts, reports = [], []
+                prompts, prefills, reports = [], [], []
                 for c in chunk:
                     idx = select_to_prune(c["steps"], ratio, strat, args.seed)
                     pruned = apply_pruning(c["steps"], idx)
                     reports.append(pruning_report(c["steps"], idx))
-                    prompts.append(build_compressed_prompt(c["question"], pruned))
-                outs = lm.generate_with_entropy(prompts, max_tokens=256, logprobs=1)
+                    # The question goes in the user turn; the pruned chain is
+                    # pre-filled into the ASSISTANT turn, so the model resumes
+                    # its own reasoning rather than reading someone else's.
+                    prompts.append(COT_PROMPT.format(question=c["question"]))
+                    prefills.append(build_compressed_prefill(
+                        pruned, think_tags=args.think_tags))
+                outs = lm.generate_with_entropy(
+                    prompts, max_tokens=256, logprobs=1, prefills=prefills)
                 for c, o, rep in zip(chunk, outs, reports):
                     ans = extract_answer(o["text"])
                     hit = answers_match(ans, c["truth"])

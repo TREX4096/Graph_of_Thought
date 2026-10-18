@@ -297,6 +297,7 @@ class MockLM(AbstractLanguageModel):
         max_tokens: Optional[int] = None,
         stop: Optional[Sequence[str]] = None,
         logprobs: int = 20,
+        prefills: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, object]]:
         """Synthesise a multi-step chain with deliberately uneven entropy.
 

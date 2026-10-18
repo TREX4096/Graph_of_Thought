@@ -39,24 +39,41 @@ Problem: {question}
 """
 
 
-# The compressed chain is presented as the model's own prior reasoning.
-# Telling it explicitly that [SKIP] marks elided steps matters: the paper
-# finds the marker degrades far less than a silent deletion, because the
-# model is told reasoning happened rather than being shown a gap.
-COMPRESSED_PROMPT = """Solve the following problem.
+# Stage 3 is a CONTINUATION, not a new question.
+#
+# The paper places the compressed chain inside the think context - after the
+# query, before </think> - so the model resumes its own partial reasoning and
+# writes only the answer. An earlier version of this file instead opened a
+# fresh user turn containing a "Reasoning:" block, which is a different task:
+# read someone else's working rather than finish your own. On a reasoning
+# model that is out of distribution, and it showed - the full-chain baseline
+# came in 19 points below the paper's and every pruning strategy collapsed to
+# the same accuracy, which is what you see when the supplied chain is being
+# ignored.
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
 
-Below is a partial reasoning trace. Steps marked [SKIP] were omitted for brevity - assume they were completed correctly.
 
-Problem: {question}
+def build_compressed_prefill(chain: str, think_tags: bool = True) -> str:
+    """Assistant-turn prefill holding the pruned chain.
 
-Reasoning:
-{chain}
-
-Based on the reasoning above, state the final answer on its own line, in the form:
-Final answer: <answer>
-"""
+    Returned text is appended after the generation prompt, so the model
+    continues from it. With ``think_tags`` the chain is wrapped so a
+    reasoning model sees a completed think block and moves to the answer;
+    without them it is plain prefilled reasoning, which suits an instruct
+    model that never emits think tags at all.
+    """
+    body = chain.strip()
+    if think_tags:
+        return f"{THINK_OPEN}\n{body}\n{THINK_CLOSE}\n\nFinal answer:"
+    return f"{body}\n\nFinal answer:"
 
 
 def build_compressed_prompt(question: str, chain: str) -> str:
-    """Stage-3 prompt: pruned chain in, final answer out."""
-    return COMPRESSED_PROMPT.format(question=question.strip(), chain=chain.strip())
+    """Deprecated: kept so older result scripts still import cleanly.
+
+    Use :func:`build_compressed_prefill` with the prompt from
+    :data:`COT_PROMPT`. See the note above on why a separate user turn
+    measures the wrong thing.
+    """
+    return COT_PROMPT.format(question=question.strip())
