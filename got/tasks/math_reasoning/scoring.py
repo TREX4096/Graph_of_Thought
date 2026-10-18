@@ -46,6 +46,11 @@ def _last_boxed(text: str) -> Optional[str]:
 
 NUMBER = re.compile(r"-?\d[\d,]*\.?\d*")
 
+# Models occasionally wrap the answer in markup - we have seen
+# '<span class="final-answer">448/15625'. The value inside was correct,
+# so that was our extraction failing, not the model. Strip tags first.
+HTML_TAG = re.compile(r"<[^>]{0,80}>")
+
 
 def extract_answer(text: str) -> str:
     """Pull the final answer out of a model completion.
@@ -57,6 +62,7 @@ def extract_answer(text: str) -> str:
     """
     if not text:
         return ""
+    text = HTML_TAG.sub("", text)
     boxed = _last_boxed(text)
     if boxed:
         return boxed.strip()
@@ -68,6 +74,17 @@ def extract_answer(text: str) -> str:
             cand = line[m.end():].strip().rstrip(".").strip()
             if cand:
                 return cand
+
+    # If what remains is already a bare answer - a fraction, a surd, a short
+    # expression - return it whole. Falling through to "last number in the
+    # text" would turn 448/15625 into 15625 and 11\sqrt{2} into 2, picking
+    # a fragment of the answer rather than the answer.
+    stripped = text.strip()
+    if stripped and len(stripped) <= 40 and "\n" not in stripped:
+        # Ignore LaTeX command names when deciding whether this is prose.
+        words = re.findall(r"[A-Za-z]{3,}", re.sub(r"\\[a-zA-Z]+", "", stripped))
+        if not words:                       # no prose - it is the answer itself
+            return stripped
 
     nums = NUMBER.findall(text)
     return nums[-1].replace(",", "") if nums else ""
@@ -90,12 +107,27 @@ _STRIP = [
 _DEGREES = re.compile(r"\^\\?circ|\\degree")
 
 
+# "x=5" and "5" are the same answer; the variable belongs to the
+# question, not to the model. Only a single letter being assigned is
+# stripped, so an equation that genuinely IS the answer survives.
+_ASSIGN = re.compile(r"^[a-z]\s*=\s*", re.I)
+
+# "3 treeks" is 3. Only a trailing alphabetic word after a bare number
+# is dropped, so LaTeX commands and symbolic answers are untouched.
+_TRAILING_UNIT = re.compile(r"^(-?[\d.,]+)\s*[a-z]{2,}\.?$", re.I)
+
+
 def normalise_answer(a: str) -> str:
     """Canonicalise a LaTeX or plain answer for comparison."""
     if a is None:
         return ""
     s = str(a).strip()
+    s = HTML_TAG.sub("", s)
     s = _DEGREES.sub("", s)
+    m = _TRAILING_UNIT.match(s)
+    if m:
+        s = m.group(1)
+    s = _ASSIGN.sub("", s)
     for pat, rep in _STRIP:
         s = pat.sub(rep, s)
     s = s.replace(",", "")
@@ -129,6 +161,10 @@ def _as_number(s: str) -> Optional[float]:
     return None
 
 
+def _strip_braces(s: str) -> str:
+    return re.sub(r"\{([^{}]*)\}", r"\1", s)
+
+
 def answers_match(produced: str, truth: str, tol: float = 1e-6) -> bool:
     """True when two answers denote the same value.
 
@@ -143,4 +179,7 @@ def answers_match(produced: str, truth: str, tol: float = 1e-6) -> bool:
     pn, tn = _as_number(p), _as_number(t)
     if pn is not None and tn is not None:
         return abs(pn - tn) <= tol * max(1.0, abs(tn))
-    return False
+    # Brace style must not decide correctness: 11\\sqrt{2} is 11\\sqrt2.
+    # Last resort, on fully normalised strings only, so it cannot
+    # collapse genuinely different expressions.
+    return _strip_braces(p) == _strip_braces(t)
