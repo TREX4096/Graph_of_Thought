@@ -150,7 +150,25 @@ def main() -> None:
             })
     gen_s = time.time() - t0
 
-    base_correct = sum(answers_match(c["full_answer"], c["truth"]) for c in chains)
+    # Per-instance rows for EVERY stage, not just the pruned ones. The
+    # baseline has to be re-gradable too: a scorer fix that lifts the pruned
+    # cells but leaves the full chain at its old grading inflates every
+    # margin measured against it.
+    per_instance: List[Dict[str, Any]] = []
+    for c in chains:
+        hit = answers_match(c["full_answer"], c["truth"])
+        per_instance.append({
+            "id": c["id"], "ratio": "-", "strategy": "full",
+            "correct": int(hit), "answer": c["full_answer"], "truth": c["truth"],
+            "n_steps": len(c["steps"]), "n_pruned": 0,
+            "tokens_before": c["n_tokens"], "tokens_after": c["n_tokens"],
+            "mean_entropy_kept": round(
+                sum(s.entropy for s in c["steps"]) / len(c["steps"]), 4
+            ) if c["steps"] else 0.0,
+            "mean_entropy_pruned": 0.0,
+        })
+
+    base_correct = sum(r["correct"] for r in per_instance if r["strategy"] == "full")
     base_tokens = sum(c["n_tokens"] for c in chains) / max(1, len(chains))
     mean_steps = sum(len(c["steps"]) for c in chains) / max(1, len(chains))
     print(f"\n  full chain: acc {base_correct/len(chains):.1%}  "
@@ -171,12 +189,21 @@ def main() -> None:
             [ANSWER_ONLY_PROMPT.format(question=r["question"]) for r in chunk],
             max_tokens=96, logprobs=1)
         for r, o in zip(chunk, outs):
-            ctrl_correct += answers_match(extract_answer(o["text"]), r["answer"])
+            ans = extract_answer(o["text"])
+            hit = answers_match(ans, r["answer"])
+            ctrl_correct += hit
+            per_instance.append({
+                "id": r.get("id"), "ratio": "-", "strategy": "none",
+                "correct": int(hit), "answer": ans, "truth": r["answer"],
+                "n_steps": 0, "n_pruned": 0,
+                "tokens_before": 0, "tokens_after": 0,
+                "mean_entropy_kept": 0.0, "mean_entropy_pruned": 0.0,
+            })
     print(f"\n  answer only: acc {ctrl_correct/len(rows):.1%}")
 
     # ---------------- Stage 3: prune and re-answer ----------------
     print("\nStage 3/3  pruning and re-answering")
-    results, per_instance = [], []
+    results: List[Dict[str, Any]] = []
     for ratio in args.ratios:
         for strat in args.strategies:
             correct, tok_before, tok_after = 0, 0, 0

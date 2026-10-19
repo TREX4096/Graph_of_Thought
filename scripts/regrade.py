@@ -70,9 +70,12 @@ def main() -> None:
                 w.writeheader(); w.writerows(rows)
             print(f"  wrote {out}")
 
-    print("\nNote: this re-grades the PRUNED answers only. The full-chain")
-    print("baseline is computed in stage 1 and not saved per instance, so it")
-    print("cannot be re-graded here - it needs a rerun to benefit.")
+    have_full = any(r["strategy"] == "full" for r in rows)
+    if not have_full:
+        print("\nNote: this run predates per-instance baseline logging, so the")
+        print("'full' and 'none' rows are absent and only the PRUNED cells are")
+        print("re-graded. Margins measured against that baseline are therefore")
+        print("flattering - the baseline would rise too. Rerun to fix.")
 
 
 if __name__ == "__main__":
